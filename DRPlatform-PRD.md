@@ -11,6 +11,8 @@
 | 技术栈 | Spring Boot 3.4.3 + MyBatis-Plus 3.5.9 + Java 17 / React 18 UMD |
 | 输出路径 | `D:\WorkSpace\remote-data-sync\DRPlatform-PRD.md` |
 
+> ⚠️ **本文档（PRD）偏需求定义，部分实现细节已过时**：默认端口为 **8899**（非 8080/8090）；同步进度接口为 **`POST /sync/db/list`**、详情为 **`GET /sync/{id}`**（非 `/sync/progress`）；密码哈希为 **PBKDF2**（非 `salt:sha256`）；鉴权为**服务端 Session + AuthInterceptor**。准确且最新的架构、API、安全模型、配置与部署请以 **[产品规格说明书](DRPlatform-产品规格说明书.md)** 为准。
+
 ---
 
 ## 1. 产品概述

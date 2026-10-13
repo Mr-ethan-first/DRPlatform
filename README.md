@@ -1,439 +1,301 @@
 # DRPlatform — MySQL 跨主机数据库灾备同步中间件
 
-DRPlatform 将生产中心 MySQL 数据库的数据实时同步到异地灾备中心。采用"主机对模型 + 自动库发现"设计，运维人员只需配置一组源主机与目标主机，引擎自动发现源端全部用户库表并启动同步，新增库表无需人工介入。
+DRPlatform 将生产中心 MySQL 的数据实时、可靠地同步到异地灾备中心。采用"主机对模型 + 自动库发现"设计：运维只需配置一组源主机与目标主机，引擎自动发现源端全部用户库表并启动同步，新增库表无需人工介入。同步引擎为**自研内嵌轮询水位引擎（SyncHostJob）**，**不依赖 Flink 集群**，部署轻量。
+
+> 文档导航：完整功能与配置见 [产品规格说明书](DRPlatform-产品规格说明书.md)；上线与运维操作见 [使用说明书](DRPlatform-使用说明书.md)；当前支持能力速览见 [特性清单](DRPlatform-特性清单.md)；需求背景见 [PRD](DRPlatform-PRD.md)；详细设计与数据库见 [详细设计说明书](DRPlatform-详细设计说明书.md)；安装细节见 [安装部署指南](DRPlatform-安装部署指南.md)。
 
 ## 核心能力
 
 | 能力 | 说明 |
 |------|------|
-| 自动库发现 | 60 秒扫描周期自动发现源端新增库表并纳入同步 |
-| 全量 + 增量同步 | 首次全量流式分页扫描，后续按 `update_time` 增量同步，P99 延迟 < 3 秒 |
-| 双模式忽略规则 | DML+DDL 忽略与仅 DDL 忽略独立配置，支持精确/glob/正则三种匹配 |
-| 跨版本 DDL 清洗 | MySQL 8.0 专有语法自动降级为 5.7 兼容语法 |
-| 字段转换 | 支持 IP 替换、字段脱敏、枚举映射，全局映射与私有映射分层 |
-| 配置热生效 | 修改配置无需重启，通过 API 即时更新引擎 |
+| 自动库发现 | 周期扫描（约 60s）自动发现源端新增库表并纳入同步 |
+| 全量 + 增量同步 | 首次全量流式分页；后续按 `update_time` 水位增量同步，增量单批上限 5000 行（keyset 续扫，同时间戳大批量不丢） |
+| 双模式忽略规则 | DML+DDL 忽略 与 仅 DDL 忽略 独立配置，支持精确 / glob / 正则（`re:`）三种匹配 |
+| 跨版本 DDL 清洗 | MySQL 8.0 专有语法（如 `utf8mb4_0900_ai_ci`）自动降级为 5.7 兼容语法 |
+| 字段转换 | IP 替换、字段脱敏、枚举映射；全局映射与私有映射分层 |
+| 配置热生效 | 修改忽略规则 / 字段映射 / 连接参数无需重启，API 即时生效 |
 | 断电断网续传 | 水位丢失自动全量重扫，幂等 upsert 保证最终一致 |
+| 故障容错与一致性 | 源库 / 目标库 / 同步服务进程断电重启后数据最终一致（故障注入测试覆盖） |
 | 多用户隔离 | 配置按用户隔离，私有配置仅创建者可见 |
-| 操作审计 | AOP 切面自动记录所有操作，密码脱敏后入库 |
-| HA 高可用 | 检测 MySQL 主备切换，自动重建连接池并恢复同步 |
-| Web 管理后台 | React 单页应用，可视化监控同步进度与异常 |
+| 操作审计 | AOP 切面自动记录所有操作，密码等敏感字段脱敏后入库 |
+| Web 管理后台 | React 单页应用，可视化监控同步进度与异常，支持双主题一键切换 |
+| 安全加固 | 服务端 Session 鉴权、CORS 非通配符、PBKDF2 密码哈希、标识符 SQL 注入白名单、密码落盘 AES 加密（`ENC:`） |
 
 ## 技术栈
 
 | 层级 | 选型 |
 |------|------|
-| 后端 | Spring Boot 3.4.3 + MyBatis-Plus 3.5.9 + Java 17 |
-| 前端 | React 18 UMD + JSX 构建期预编译（无 Node 运行时依赖） |
-| 数据库 | MySQL 8.0（源端）→ MySQL 5.7（目标端），跨大版本兼容 |
-| 连接池 | HikariCP + 全局信号量限流 |
-| 部署 | systemd + Nginx 反向代理 |
+| 后端 | Spring Boot 3.4.3 + MyBatis-Plus 3.5.9 + Java 17（编译/运行可用 JDK 21） |
+| 前端 | React 18 UMD + JSX 构建期预编译（Babel 生成 `app.js`，运行时无 Node 依赖） |
+| 数据库 | MySQL 8.0（源）→ MySQL 5.7（目标），跨大版本兼容；同版本任意方向亦可 |
+| 连接池 | HikariCP + 全局信号量限流，临时不可用时自动重连 |
+| 鉴权 | 服务端 HttpSession + 自定义 `AuthInterceptor`（非 Spring Security，非 JWT） |
+| 部署 | systemd + Nginx 反向代理 + Watchdog 守护进程（开机自启 / 宕机自愈） |
+
+> 端口：**默认 `8899`**（jar 内嵌、linux profile、`watchdog.sh`、目标机 `application-linux.yml` 均为 8899）。注意 `deploy/deploy.sh` 内的 Nginx 反代曾写死 `8080`，部署后需核对反代端口与 `8899` 一致。
 
 ## 快速部署
 
 ### 环境要求
-
-- Linux（CentOS 7 / Ubuntu 18.04+ / 其他主流发行版）
-- root 权限
-- MySQL 5.7+（源端与目标端可同机或异机）
+- Linux（CentOS 7 / Ubuntu 18.04+ / Rocky 8·9 等主流发行版）
+- JDK 17+（运行）、MySQL 5.7+（源端与目标端可同机或异机）
 - 网络可达源端与目标端 MySQL 的 3306 端口
 
-### 一键安装
-
-将 `remote-data-sync.jar`、`install.sh`、`init.sql` 放在同一目录下，执行：
+### 构建
+> 本仓库使用自带的 `mvn3.sh`（避免系统 `mvn` 在 Git-Bash 下的路径问题）：
 
 ```bash
-sudo bash install.sh
+cd remote-data-sync
+bash /d/WorkSpace/flink-cdc-sync/mvn3.sh -o clean package -DskipTests
+# 产物：remote-data-sync/target/remote-data-sync.jar
 ```
 
-脚本会依次完成 8 个步骤：
+前端为构建期预编译产物（`frontend/app.js` 由 `frontend/build_app.js` 经 Babel 生成），随 jar 内嵌 `static/` 提供，无需 Node 运行时。
 
-1. **前置检查** — 验证 root 权限、定位 jar 包
-2. **交互式配置** — 输入 MySQL 主机、端口、用户名、密码（无默认值，密码需二次确认）、后端端口、同步源/目标主机
-3. **安装依赖** — 自动安装 Java 17+、Nginx、MySQL 客户端（如未安装）
-4. **测试 MySQL 连接** — 验证输入的凭据可连通
-5. **创建数据库** — 创建 `DRPlatform` 元数据库并初始化表结构
-6. **部署应用** — 复制 jar 包、前端资源到 `/data/DRPlatform/`，生成 `application-linux.yml`
-7. **配置 systemd** — 创建 `DRPlatform.service`，开机自启
-8. **配置 Nginx** — 创建反向代理 vhost，启动服务并健康检查
+### 部署与启动（目标机 Linux）
+推荐用 `deploy/` 下的脚本完成一键部署与守护：
 
-安装完成后输出访问地址与常用命令。
+```bash
+# 一键部署（装 Java/Nginx、布 jar+前端、初始化元库、配 systemd + Nginx 反代）
+sudo bash remote-data-sync/deploy/deploy.sh
 
-### 交互式配置示例
+# 或交互式安装（输入 MySQL 账号、后端端口默认 8899、源/目标 IP，生成 application-linux.yml）
+sudo bash remote-data-sync/deploy/install.sh
 
-```
-请配置 MySQL 数据库连接信息（无默认值，必须手动输入）：
-
-MySQL 主机地址: 192.168.88.88
-MySQL 端口: 3306
-MySQL 用户名: root
-MySQL 密码: ********
-确认密码: ********
-
-DRPlatform 后端服务端口配置：
-后端服务端口 (默认 8090): 8090
-
-数据库同步映射配置（源主机数据 → 目标主机）：
-同步源主机 IP (回车=使用 MySQL 主机地址 192.168.88.88):
-同步目标主机 IP (回车=使用本机 MySQL 192.168.88.88):
+# 服务管理（基于 watchdog 守护）
+bash remote-data-sync/deploy/start.sh     # 启动 + 开启开机自启
+bash remote-data-sync/deploy/stop.sh      # 停止（先停 watchdog，手动停止不自动拉起）
+bash remote-data-sync/deploy/boot.sh status  # 查看开机自启状态
+systemctl status DRPlatform              # 查看服务
 ```
 
-## 目录结构
+部署后访问 `http://<服务器IP>:8899/`。**默认管理员账号 `admin / admin123`，首次部署后请立即修改密码。**
 
-安装后的目录布局：
+> 若从外部无法访问，请确认目标机防火墙已放行 `8899/tcp`（CentOS：`firewall-cmd --permanent --add-port=8899/tcp && firewall-cmd --reload`）。
+
+## 目录结构（部署后）
 
 ```
 /data/DRPlatform/
 ├── bin/
-│   └── remote-data-sync.jar      # 应用主包
+│   └── remote-data-sync.jar        # 应用主包
 ├── conf/
-│   ├── application-linux.yml   # 运行配置（由 install.sh 生成）
-│   └── db/
-│       └── init.sql            # 数据库初始化脚本
-├── frontend/                   # 前端静态资源
-│   ├── index.html
-│   └── app.js
+│   └── application-linux.yml       # 运行配置（由 install.sh 生成）
 ├── logs/
-│   ├── app.log                 # 应用日志
-│   ├── app.out                 # 标准输出
-│   └── app.err                 # 错误输出
-└── savepoint/                  # Savepoint 目录（Flink 模式）
+│   ├── app.log / app.out / app.err # 日志
+└── run/                            # 运行时文件（含动态映射 DRPlatform-dynamic-mappings.json）
 ```
+
+> 元数据库 `DRPlatform` 独立存放配置、水位、审计，与业务库分离。动态新增的主机对持久化到 `DRPlatform-dynamic-mappings.json`（密码以 `ENC:` 密文存储）。
 
 ## 配置说明
 
-主配置文件：`/data/DRPlatform/conf/application-linux.yml`
+主配置文件：`remote-data-sync/src/main/resources/application.yml`（内嵌 `linux` profile），部署后实际为 `/data/DRPlatform/conf/application-linux.yml`。
 
 ### 核心配置项
 
 ```yaml
-DRPlatform:
-  standby-mode: true              # true=启动同步引擎，false=仅管理后台
+server:
+  port: 8899                         # 默认端口
+drplatform:
+  standby-mode: true                # true=启动同步引擎，false=仅管理后台
+  flink:
+    enabled: false                  # 走内嵌轮询引擎，不提交真实 Flink 集群
   engine:
-    poll-interval-ms: 2000        # 同步轮询间隔（毫秒）
-    batch-size: 1000              # 单批次行数
-    max-queue-size: 20000         # 死信队列上限
-    reconcile-interval-ms: 10000  # 对账间隔（毫秒）
-    deviation-timeout-sec: 300    # 偏差超时告警（秒）
+    poll-interval-ms: 2000          # 同步轮询间隔（毫秒）
+    batch-size: 1000                # 单批次行数（增量单批 = batch-size * 5 = 5000）
+    max-queue-size: 20000           # 死信队列上限
+    reconcile-interval-ms: 10000    # 对账间隔（毫秒）
+    deviation-timeout-sec: 300      # 偏差超时告警（秒）
   connection:
-    max-pool-size: 32             # 单主机连接池上限
-    max-global-connections: 200   # 全局连接数信号量
+    max-pool-size: 32               # 单主机连接池上限
+    max-global-connections: 200     # 全局连接数信号量
   mappings:
-    - source-host: 192.168.88.88  # 源端 MySQL 主机
+    - source-host: 192.168.88.88    # 源端 MySQL 主机
       source-port: 3306
       source-user: root
-      source-password: ********
-      target-host: 192.168.88.88  # 目标端 MySQL 主机
+      source-password: "********"   # 落盘为 ENC: 密文
+      target-host: 192.168.88.88
       target-port: 3306
       target-user: root
-      target-password: ********
-      ignore-databases: ["day01"] # 整库忽略（支持正则 re:^tmp_.*）
-      ignore-tables: []           # 表忽略（DML+DDL 均跳过）
-      ignore-ddl-tables: []       # 仅忽略 DDL（数据仍同步）
-      transform-rules: []         # 字段转换规则
+      target-password: "********"
+      ignore-databases: ["day01"]   # 整库忽略（支持 re:^tmp_.*）
+      ignore-tables: []             # 表忽略（DML+DDL 均跳过）
+      ignore-ddl-tables: []         # 仅忽略 DDL（数据仍同步）
+      transform-rules: []           # 字段转换规则
+app:
+  auth:
+    enabled: true                   # 是否启用登录鉴权（test profile 关闭）
+  cors:
+    allowed-origins: ""             # 逗号分隔的允许跨域来源；为空仅允许同源（禁止 * + 凭据）
 ```
 
 ### 忽略规则语法
-
-三种匹配语法可在同一规则集中混用：
-
-| 语法 | 示例 | 说明 |
-|------|------|------|
-| 精确匹配 | `db_name.table_name` | 完全匹配库表名 |
-| Glob 通配 | `db_*.log_*` | 支持 `*` 通配符 |
-| 正则匹配 | `re:^shard_\d+\..*` | `re:` 前缀触发正则模式 |
+三种匹配可混用：`db.table`（精确）、`db_*.log_*`（glob）、`re:^shard_\d+\..*`（正则）。
 
 ### 字段转换规则
-
 ```yaml
 transform-rules:
   - database: geo_source
     table: t_user
     column: phone
-    type: MASK         # MASK=脱敏, REPLACE=替换, MAP=枚举映射
+    type: MASK          # MASK=脱敏, REPLACE=替换, MAP=枚举映射
     oldValue: ""
     newValue: "138****0000"
 ```
 
 ### 配置热生效
-
-修改配置后无需重启服务，调用 API 即时生效：
-
 ```bash
-# 增量更新单个主机对配置
-curl -X POST http://localhost:8090/sync/mapping/update \
-  -H "Content-Type: application/json" \
-  -H "Cookie: JSESSIONID=<your-session-id>" \
+# 增量更新单个主机对（无需重启）
+curl -X POST http://localhost:8899/sync/mapping/update \
+  -H "Content-Type: application/json" -b cookies.txt \
   -d '{"sourceHost":"192.168.88.88","ignoreDatabases":["day01","day02"]}'
-
-# 全量重载所有配置
-curl -X POST http://localhost:8090/sync/mapping/reload \
-  -H "Cookie: JSESSIONID=<your-session-id>"
+# 全量重载
+curl -X POST http://localhost:8899/sync/mapping/reload -b cookies.txt
 ```
 
 ## 服务管理
 
 ```bash
-# 启动
-systemctl start DRPlatform
-
-# 停止
-systemctl stop DRPlatform
-
-# 重启
-systemctl restart DRPlatform
-
-# 查看状态
-systemctl status DRPlatform
-
-# 查看实时日志
-journalctl -u DRPlatform -f
-
-# 查看应用日志
+systemctl start DRPlatform     # 启动（经 watchdog 拉起）
+systemctl stop  DRPlatform     # 停止
+systemctl status DRPlatform    # 状态
+journalctl -u DRPlatform -f    # 实时日志
 tail -f /data/DRPlatform/logs/app.log
 ```
 
+Watchdog（`watchdog.sh`）负责进程保活：应用崩溃自动拉起；`stop.sh` 先终止 watchdog 再停应用，保证"手动停止不被自动拉回"。
+
 ## API 接口
 
-所有接口需登录后携带 `JSESSIONID` Cookie 访问（除 `/auth/**` 和 `/actuator/**`）。
+除 `/auth/**` 与静态资源外，所有接口需登录后携带 Session Cookie（`JSESSIONID`）访问，未登录返回 **401 JSON**。
 
 ### 鉴权
-
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/auth/login` | 登录，返回 JSESSIONID |
-| POST | `/auth/register` | 注册新用户 |
-| POST | `/auth/logout` | 登出 |
+| POST | `/auth/register` | 注册新后台用户（密码 PBKDF2 加盐） |
+| POST | `/auth/login` | 登录，成功后写 Session（默认约 30 分钟空闲失效） |
+| POST | `/auth/logout` | 登出，使 Session 失效 |
+| GET  | `/auth/me` | 登录态探测（恒返回 200，`{loggedIn:true/false}`） |
 
-### 同步配置
-
+### 同步配置 / 监控 / 元数据（前缀 `/sync`）
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/sync/mappings` | 查询当前用户可见的主机对列表 |
-| POST | `/sync/mapping/add` | 新增主机对 |
-| POST | `/sync/mapping/remove` | 移除主机对 |
-| POST | `/sync/mapping/update` | 增量更新主机对配置（热生效） |
-| POST | `/sync/mapping/reload` | 全量重载配置 |
+| GET  | `/sync/mappings` | 当前用户可见的主机对列表（密码脱敏） |
+| POST | `/sync/mapping/add` | 批量新增主机对（启动同步作业） |
+| POST | `/sync/mapping/remove` | 移除动态新增的映射 |
+| POST | `/sync/mapping/reload` | 热重载指定主机对并重建作业 |
+| POST | `/sync/mapping/update` | 运行时更新映射配置字段（热生效） |
+| POST | `/sync/mapping/test` | 源/目标端连通性测试 |
+| POST | `/sync/sourceDatabases` | 枚举源实例可同步用户库（排除系统库） |
+| POST | `/sync/sourceTables` | 枚举指定库下用户表 |
+| GET  | `/sync/databases/{ips}` | 按 IP 获取其下用户数据库列表 |
+| GET  | `/sync/ipList` | 获取生产/灾备中心 IP 列表 |
+| POST | `/sync/db/list` | **分页查询同步进度**（注意：非 `/sync/progress`） |
+| GET  | `/sync/{id}` | 按 ID 查询同步详情 |
+| GET  | `/sync/status` | 同步引擎整体状态（含 ABNORMAL 判定） |
+| POST | `/sync/resyncDatabases` | 触发指定库全量重同步 |
 
-### 同步监控
-
+### 审计日志（前缀 `/operation-log`）
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/sync/progress` | 查询同步进度 |
-| GET | `/sync/status` | 查询引擎整体状态 |
-| POST | `/sync/resync` | 触发指定表全量重同步 |
-| POST | `/sync/connection-test` | 测试源/目标端连通性 |
+| POST | `/operation-log/list` | 分页查询操作审计（用户名/类型/结果/IP/时间段过滤） |
+| GET  | `/operation-log/types` | 操作类型枚举（前端筛选下拉） |
 
-### 元数据查询
-
+### 健康检查（Actuator，仅暴露 health/info/metrics）
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/sync/source-databases` | 查询源端用户库列表 |
-| GET | `/sync/source-tables` | 查询指定库的用户表列表 |
-
-### 审计日志
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/operation-log/list` | 分页查询操作日志 |
-| GET | `/operation-log/types` | 查询操作类型枚举 |
-
-### 健康检查
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/actuator/health` | 服务健康检查 |
+| GET | `/actuator/health` | 服务健康检查（show-details: always） |
+| GET | `/actuator/info` | 基本信息 |
 | GET | `/actuator/metrics` | 运行指标 |
 
 ### 登录示例
-
 ```bash
-# 登录获取 Cookie
-curl -c cookies.txt -X POST http://localhost:8090/auth/login \
+curl -c cookies.txt -X POST http://localhost:8899/auth/login \
   -H "Content-Type: application/json" \
   -d '{"username":"admin","password":"admin123"}'
-
-# 使用 Cookie 查询同步进度
-curl -b cookies.txt http://localhost:8090/sync/progress
+curl -b cookies.txt http://localhost:8899/sync/status
 ```
 
-默认管理员账号：`admin` / `admin123`，首次部署后请立即修改密码。
+## 安全特性
 
-## 数据库表结构
-
-元数据库 `DRPlatform` 包含以下管控表：
-
-| 表名 | 用途 |
+| 维度 | 实现 |
 |------|------|
-| `sync_progress` | 同步进度与水位记录 |
-| `dbha_switch_status` | MySQL 主备切换状态 |
-| `source_latest_binlog_info` | 源端最新 Binlog 位点 |
-| `sync_restart_task` | 重启任务队列 |
-| `sys_user` | 后台管理用户 |
-| `operation_log` | 操作审计日志 |
+| 认证 | 服务端 HttpSession + `AuthInterceptor`，保护 `/sync/**` 与 `/operation-log/**`；`app.auth.enabled` 可关 |
+| 授权隔离 | 配置按 `owner_id` 隔离，普通用户仅见自己资源，管理员可全局排查 |
+| CORS | `drplatform.cors.allowed-origins` 显式来源列表；**禁止 `*` 与 `allowCredentials(true)` 同用**（防 CSRF 反射任意 Origin） |
+| 密码哈希 | `PasswordUtil` 采用 **PBKDF2WithHmacSHA256，12 万次迭代，256-bit 密钥，加盐 16 字节**；格式 `pbkdf2$iterations$salt$hash`；兼容历史 `salt:hash`（SHA-256） |
+| 密码落盘 | 动态映射的源/目标密码以 `CryptoUtil`（AES）加密，`ENC:` 前缀存储，加载时解密 |
+| SQL 注入防护 | 库/表标识符走白名单 `^[A-Za-z0-9_$]{1,64}$`（`DatabaseMetadataService.assertSafeIdentifier`），DDL 拼接前强制校验 |
+| 审计脱敏 | AOP 切面记录所有操作，`password` 等敏感字段入库前脱敏为 `***` |
 
 ## 测试
 
-项目包含 188 个自动化测试用例，覆盖前后端全链路：
+自动化测试覆盖鉴权、同步引擎、故障注入、安全加固与前端：
 
-| 测试模块 | 文件 | 用例数 | 覆盖范围 |
-|----------|------|--------|----------|
-| 鉴权 | test_01_auth | 22 | 登录/注册/登出/会话过期 |
-| 同步读取 | test_02_sync_read | 22 | 进度查询/状态查询/分页 |
-| 连接测试 | test_03_sync_connection | 17 | 源/目标端连通性验证 |
-| 同步映射 | test_04_sync_mapping | 11 | 主机对增删改查 |
-| 重同步 | test_05_sync_resync | 5 | 手动触发全量重扫 |
-| 安全 | test_06_security | 13 | 未授权访问/SQL 注入防护 |
-| 同步引擎 | test_07_sync_engine | 11 | INSERT/UPDATE/DELETE/DDL |
-| 定时任务 | test_08_scheduled_jobs | 7 | 库发现/Binlog/进度/HA |
-| 元数据 | test_09_metadata_service | 5 | 库表列表查询 |
-| 连接池 | test_10_connection_pool | 5 | 并发连接/信号量限流 |
-| 忽略与转换 | test_11_ignore_transform | 9 | 忽略规则/字段转换 |
-| HA 与重启 | test_12_ha_restart | 9 | 主备切换/进程重启恢复 |
-| 配置热生效 | test_13_config_hot_reload | 14 | 动态配置/断电续传 |
-| 用户隔离与审计 | test_14_user_isolation_audit | 23 | 用户隔离/操作日志/IP 记录 |
+| 类别 | 文件 / 类 | 用例数 | 覆盖 |
+|------|-----------|--------|------|
+| 集成测试（Python + pytest） | `tests/test_01_auth.py` … `test_18_security_robustness.py`（19 个模块） | **253** | 鉴权、同步只读/连接/映射、健壮性、安全、引擎端到端、定时任务、元数据、连接池、忽略转换、HA 重启、配置热生效、用户隔离审计、操作日志、主题切换 |
+| 故障注入一致性 | `tests/test_17_fault_injection_consistency.py` | 5 | 源库/目标库/服务断电重启 + 多轮稳定性，数据最终一致 |
+| 安全与健壮性 | `tests/test_18_security_robustness.py` | 5 | CORS 非通配符、密码密文落盘、监控盲区 ABNORMAL、同时间戳 5200 行不丢、元数据注入拦截 |
+| JUnit 单元 | `SecurityHardeningTest` / `DRPlatformConsistencyTest` | 17 | SQL 注入白名单、CryptoUtil、PBKDF2、跨主机一致性 |
 
-运行测试：
-
+运行（需先启动应用与 MySQL）：
 ```bash
-# 确保 MySQL 与应用服务已启动
-cd D:\WorkSpace\remote-data-sync
-python -m pytest tests/ -v
-
-# 运行单个测试模块
-python -m pytest tests/test_01_auth.py -v
-
-# 跳过破坏性测试
-python -m pytest tests/ -v -m "not destructive"
+cd tests && python -m pytest test_17_fault_injection_consistency.py -v   # 需 docker-lab 隔离环境
+cd tests && python -m pytest test_18_security_robustness.py -v
 ```
-
-测试环境变量：
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `DRPlatform_BASE_URL` | `http://127.0.0.1:8080` | 被测服务地址 |
-| `DRPlatform_ADMIN_USER` | `admin` | 管理员账号 |
-| `DRPlatform_ADMIN_PASS` | `admin123` | 管理员密码 |
+隔离测试实验室见 `tests/docker-lab/`（`docker-compose.yml` 源/目标 MySQL 容器 + `application-dockerlab.yml`）。
 
 ## 本地开发
 
-### 环境准备
-
-- JDK 17+
-- Maven 3.6+
-- Node.js 16+（仅前端构建需要，运行时不需要）
-- MySQL 5.7+ 或 8.0
-
-### 构建与运行
-
-```bash
-# 编译打包（跳过测试）
-mvn -DskipTests package -q
-
-# 启动后端（使用默认配置）
-java -jar target/remote-data-sync.jar
-
-# 前端构建（将 JSX 预编译为 app.js）
-cd frontend
-node build_app.js
-```
-
-前端静态资源位于 `frontend/` 目录，构建产物为 `app.js` 和 `index.html`，由 Spring Boot 静态资源服务直接提供。
-
-### 配置文件
-
-| 文件 | 用途 |
-|------|------|
-| `application.yml` | 默认配置（本地开发） |
-| `application-linux.yml` | Linux 部署配置（由 install.sh 生成） |
-| `application-test.yml` | 测试环境配置 |
+- JDK 17+（可用 21），Maven 用仓库自带 `mvn3.sh`
+- 构建：`bash mvn3.sh -o clean package -DskipTests`
+- 启动：`java -jar target/remote-data-sync.jar --server.port=8899`
+  - ⚠️ 本机若存在 `SERVER__PORT` 环境变量（如 WorkBuddy 桌面进程占用 9591），会覆盖 `application.yml` 的 8899，需显式 `--server.port=8899` 并 `unset SERVER__PORT SERVER_PORT`
+- 前端构建：`cd frontend && node build_app.js`（JSX→`app.js`，并刷新 `index.html` 缓存版本号）
 
 ## 故障排查
 
 ### 服务无法启动
+- `journalctl -u DRPlatform -n 100` 与 `tail -100 /data/DRPlatform/logs/app.err`
+- 常见：MySQL 凭据错误、`8899` 端口被占用（`netstat -tlnp | grep 8899`）、Java 版本 < 17
 
-```bash
-# 查看 systemd 日志
-journalctl -u DRPlatform -n 100
-
-# 查看应用错误日志
-tail -100 /data/DRPlatform/logs/app.err
-
-# 常见原因：
-# 1. MySQL 连接失败 — 检查 application-linux.yml 中的凭据
-# 2. 端口被占用 — netstat -tlnp | grep 8090
-# 3. Java 版本过低 — java -version 确认 >= 17
-```
+### 外部无法访问 `:8899`
+- 目标机防火墙需放行 `8899/tcp`；Nginx 反代（`deploy/deploy.sh`）若写死 `8080` 需改为 `8899` 并 `nginx -s reload`
 
 ### 同步延迟高
-
-```bash
-# 查看同步状态
-curl -b cookies.txt http://localhost:8090/sync/status
-
-# 查看同步进度
-curl -b cookies.txt http://localhost:8090/sync/progress
-
-# 常见原因：
-# 1. 大表全量同步阻塞 — 配置 ignore-databases 跳过大库
-# 2. 目标端 MySQL 压力高 — 降低 engine.batch-size
-# 3. 网络延迟 — 检查源/目标端之间的网络质量
-```
-
-### Nginx 301 重定向
-
-如果通过 80 端口访问返回 301，通常是 Nginx 配置中 `server_name` 冲突。编辑 `/www/server/nginx/conf/vhost/DRPlatform.conf`（宝塔面板）或 `/etc/nginx/conf.d/DRPlatform.conf`，将 `server_name _;` 改为实际 IP 或域名：
-
-```nginx
-server {
-    listen 80;
-    server_name 192.168.88.88;  # 改为实际 IP
-    ...
-}
-```
-
-然后执行 `nginx -s reload`。
+- `curl -b cookies.txt http://localhost:8899/sync/status` 与 `/sync/db/list` 排查
+- 大表全量阻塞 → 配置 `ignore-databases`；目标端压力大 → 降低 `engine.batch-size`
 
 ### 忘记管理员密码
-
-直接通过 MySQL 重置：
-
 ```sql
--- 连接到 DRPlatform 元数据库
 USE DRPlatform;
-
--- 查看现有用户
 SELECT ID, USERNAME FROM sys_user;
-
--- 重置 admin 密码为 admin123
--- 密码哈希格式: salt:sha256，需通过应用提供的 PasswordUtil 生成
--- 或直接删除用户重新注册：
-DELETE FROM sys_user WHERE USERNAME = 'admin';
+-- 删除后重启，SysUserInitializer 会重建默认 admin/admin123；或重新注册
+DELETE FROM sys_user WHERE USERNAME='admin';
 ```
-
-重启服务后，`SysUserInitializer` 会自动重新创建默认 admin 账号。
+> 密码哈希为 `pbkdf2$120000$salt$hash`，需经 `PasswordUtil` 生成，不建议手工写库。
 
 ## 卸载
-
 ```bash
-systemctl stop DRPlatform
+bash remote-data-sync/deploy/stop.sh
 systemctl disable DRPlatform
-rm -f /etc/systemd/system/DRPlatform.service
-rm -f /www/server/nginx/conf/vhost/DRPlatform.conf   # 宝塔面板
-# 或 rm -f /etc/nginx/conf.d/DRPlatform.conf           # 标准安装
+rm -f /etc/systemd/system/DRPlatform.service /etc/systemd/system/DRPlatform-watchdog.service
 rm -rf /data/DRPlatform
 systemctl daemon-reload
-nginx -s reload
-```
-
-元数据库 `DRPlatform` 需手动删除：
-
-```sql
-DROP DATABASE DRPlatform;
+# 元数据库手动清理：DROP DATABASE DRPlatform;
 ```
 
 ## 相关文档
 
 | 文档 | 说明 |
 |------|------|
+| [DRPlatform-产品规格说明书.md](DRPlatform-产品规格说明书.md) | 产品规格 — 架构、功能规格、安全模型、配置参考、部署架构 |
+| [DRPlatform-使用说明书.md](DRPlatform-使用说明书.md) | 使用说明书 — 部署上线、服务管理、Web 配置、监控运维、故障排查 |
+| [DRPlatform-特性清单.md](DRPlatform-特性清单.md) | 特性清单 — 当前支持能力速览 |
 | [DRPlatform-PRD.md](DRPlatform-PRD.md) | 产品需求文档 — 功能定义、用户场景、成功指标 |
-| [DRPlatform-详细设计说明书.md](DRPlatform-详细设计说明书.md) | 详细设计 — 模块设计、数据库设计、API 设计、测试策略 |
+| [DRPlatform-详细设计说明书.md](DRPlatform-详细设计说明书.md) | 详细设计 — 模块、数据库、API、测试策略 |
+| [DRPlatform-安装部署指南.md](DRPlatform-安装部署指南.md) | 安装部署详细步骤（环境 / 一键安装 / 手动 / 升级 / 卸载） |
+| [灾备同步容错与异常场景分析报告.md](灾备同步容错与异常场景分析报告.md) | 容错与异常场景分析 |
+| [前后端自动化测试与Babel错误根治报告.md](前后端自动化测试与Babel错误根治报告.md) | 自动化测试与前端构建说明 |

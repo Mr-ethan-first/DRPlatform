@@ -65,6 +65,8 @@
   <div class="card"><div class="k">实时延迟 p99</div><div class="v accent">3.7 <small>s</small></div><div class="d">受 3s checkpoint 间隔约束</div></div>
   <div class="card"><div class="k">DDL 同步 p50</div><div class="v blue">0.31 <small>s</small></div><div class="d">ADD COLUMN 结构传播</div></div>
   <div class="card"><div class="k">增量风暴</div><div class="v ok">存活 <small>无 OOM</small></div><div class="d">180s 持续写入不崩</div></div>
+  <div class="card"><div class="k">大表落库吞吐</div><div class="v blue">2.3–2.7 <small>万行/s</small></div><div class="d">20 万行大表实测（本机 6 核）</div></div>
+  <div class="card"><div class="k">增量延时 · ckpt=1s</div><div class="v ok">~1.0 <small>s</small></div><div class="d">实测单行 avg 996ms，配置驱动</div></div>
 </div>
 
 <div class="note">
@@ -253,7 +255,7 @@ DDL 结构变更亚秒级传播（0.3s）。批量 100 行在提交后约 1.9s �
 <table>
   <thead><tr><th>参数</th><th>当前值</th><th>调整效果</th></tr></thead>
   <tbody>
-    <tr><td><code>execution.checkpointing.interval</code></td><td class="num">3 s</td><td>调小（如 1s）可把 p99 压到 ~1.5s，但 checkpoint 开销与 IOPS 压力上升</td></tr>
+    <tr><td><code>execution.checkpointing.interval</code></td><td class="num">3 s（运行时可热调 1–600s）</td><td><b>实测</b>：调至 1s 后单行 avg 2.98s → <b>0.996s</b>（降 3 倍，详见第六节）；代价是 checkpoint 开销与 IOPS 压力上升</td></tr>
     <tr><td>并行度 / 连接池</td><td class="num">MiniCluster 默认</td><td>多库多表场景提高并行度可提升全量速率与批量吞吐</td></tr>
     <tr><td>目标端批量大小</td><td class="num">默认</td><td>增大 batch 可降低单条落库开销，提升高并发写入吞吐</td></tr>
   </tbody>
@@ -270,11 +272,137 @@ DDL 结构变更亚秒级传播（0.3s）。批量 100 行在提交后约 1.9s �
     <tr><td>高负载稳定性</td><td class="ok">180s 风暴存活、无 OOM、精确收敛</td><td class="ok">生产可用</td></tr>
   </tbody>
 </table>
-<p style="margin-top:18px">本报告的原始数据分别来自 <code>tests/perf-report.txt</code>、<code>tests/perf-storm-report.txt</code> 与本次新增的
-<code>tests/verify_perf_latency.py</code>（产物 <code>target/perf-latency.json</code>），均可在本机 Docker 环境复跑。</p>
+
+<!-- ============ 6. 运行时动态配置与硬件缩放实证（2026-10-18 补充） ============ -->
+<h2>六、运行时动态配置与硬件缩放实证（2026-10-18 补充）</h2>
+<p>本节为报告发布后的补充实测：引擎已支持 13 项运行时参数热调（<code>GET/POST /sync/runtime-config</code>，
+<code>apply=true</code> 时经 savepoint 无损切换、零丢数据），并行度可显式配置或按 CPU 自动适配（0=auto，1–64）。
+以下实验量化「调参数」与「换硬件」各自能带来多少收益，全部为真实运行数据。</p>
+
+<div class="note"><b>实验环境：</b>本机 <b>6 核 12 线程 / 15.9G 内存</b>（源/目标 MySQL 与本服务同机 Docker），
+应用自动并行度=12（已超售物理核）。因此本节「参数旋钮」收益为实测值；「24 核 + 16G/32G」为基于瓶颈定位的外推预估，
+部署到 24 核实机后可用 <code>tests/bench_big.py</code> 复测校准。</div>
+
+<h3>6.1 新库全量收敛的时间构成（20,000 行新库）</h3>
+<table>
+  <thead><tr><th>阶段</th><th>耗时</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td>建库 + 源端写入 2 万行</td><td class="num">0.9 s</td><td>源库本身 ~2.4 万行/s</td></tr>
+    <tr><td>库表发现 + 作业重启</td><td class="num">7–15 s</td><td>巡检间隔 ≤20s + 重启冷却 30s + savepoint 重启，<b>与数据量无关</b></td></tr>
+    <tr><td>快照导出 + 落库</td><td class="num">~2 s</td><td>3 个 split 并行</td></tr>
+    <tr><td><b>端到端合计</b></td><td class="num"><b>16.8 s</b></td><td>建库 → 目标 2 万行全部可见；另实测 1 行新库 22.2s（同口径）</td></tr>
+  </tbody>
+</table>
+<div class="note"><b>解读：</b>小数据量下「机制开销」占约 90%——<b>换 CPU/内存对此场景没有可感知提升</b>；
+要缩短只能调 <code>discoveryIntervalSec</code>（巡检节奏）与 <code>discoveryRestartCooldownSec</code>（重启冷却）。</div>
+
+<h3>6.2 增量延时：checkpoint 间隔是唯一决定因素（实测）</h3>
+<div class="chartbox">
+  <div style="font-weight:600;margin-bottom:8px">单行 INSERT 端到端延时：ckpt 3s vs 1s（同一作业热切换，10 次采样）</div>
+  <svg viewBox="0 0 680 140" width="100%" preserveAspectRatio="xMidYMid meet" role="img" aria-label="增量延时对比">
+    <g stroke="#273140" stroke-width="1">
+      <line x1="60" y1="15" x2="60" y2="110"/>
+      <line x1="240" y1="15" x2="240" y2="110" stroke-dasharray="3,3"/>
+      <line x1="420" y1="15" x2="420" y2="110" stroke-dasharray="3,3"/>
+      <line x1="600" y1="15" x2="600" y2="110" stroke-dasharray="3,3"/>
+    </g>
+    <rect x="60" y="28" width="536" height="30" rx="4" fill="#E50914"/>
+    <text x="72" y="48" fill="#fff" font-size="12">ckpt = 3s（基线） · avg 2.98s</text>
+    <rect x="60" y="72" width="179" height="30" rx="4" fill="#22c55e"/>
+    <text x="255" y="91" fill="#cdd9e5" font-size="12">ckpt = 1s（热调） · avg 0.996s（<tspan fill="#22c55e" font-weight="700">-67%</tspan>）</text>
+    <g fill="#9aa7b4" font-size="11" text-anchor="middle">
+      <text x="54" y="128">0</text><text x="234" y="128">1s</text>
+      <text x="414" y="128">2s</text><text x="594" y="128">3s</text>
+    </g>
+  </svg>
+</div>
+<table>
+  <thead><tr><th>场景</th><th>ckpt=3s（基线）</th><th>ckpt=1s（热调后实测）</th></tr></thead>
+  <tbody>
+    <tr><td>单行 INSERT（10 次采样）</td><td class="num">avg 2.98s / p50 3.01s / max 3.02s</td><td class="num ok"><b>avg 0.996s / p50 0.996s / max 1.05s</b></td></tr>
+    <tr><td>稀疏流量 INSERT / DELETE</td><td class="num">1.37s / 1.97s</td><td class="num">~1s 量级</td></tr>
+    <tr><td>批量 1000 行（单事务）</td><td class="num">0.92s</td><td class="num">0.99s（批满即 flush，不受 ckpt 约束）</td></tr>
+  </tbody>
+</table>
+<div class="note"><b>解读：</b>单行延时下界 = checkpoint 间隔（sink 必须在 barrier 前 flush，机理见第四节）。
+<b>该收益与 CPU 核数、堆内存无关，纯配置项</b>——24 核机器上把 ckpt 设为 1s 即可获得 3 倍延时改善，
+代价是 checkpoint 频率上升带来的 IOPS 压力。</div>
+
+<h3>6.3 大表吞吐与并行度缩放实验（200,000 行单表 · 三组配置）</h3>
+<div class="chartbox">
+  <div style="font-weight:600;margin-bottom:8px">纯快照落库吞吐对比（万行/s，越高越好）</div>
+  <svg viewBox="0 0 680 250" width="100%" preserveAspectRatio="xMidYMid meet" role="img" aria-label="大表吞吐三组配置对比">
+    <g stroke="#273140" stroke-width="1">
+      <line x1="60" y1="200" x2="650" y2="200"/>
+      <line x1="60" y1="150" x2="650" y2="150"/>
+      <line x1="60" y1="100" x2="650" y2="100"/>
+      <line x1="60" y1="50" x2="650" y2="50"/>
+    </g>
+    <g fill="#9aa7b4" font-size="11">
+      <text x="34" y="204">0</text><text x="24" y="154">1万</text><text x="24" y="104">2万</text><text x="24" y="54">3万</text>
+    </g>
+    <rect x="130" y="84.5" width="100" height="115.5" rx="4" fill="#3b82f6"/>
+    <text x="180" y="76" fill="#3b82f6" font-size="12" text-anchor="middle" font-weight="700">2.31万</text>
+    <rect x="310" y="84.5" width="100" height="115.5" rx="4" fill="#6b7280"/>
+    <text x="360" y="76" fill="#9aa7b4" font-size="12" text-anchor="middle" font-weight="700">2.31万</text>
+    <text x="360" y="62" fill="#f59e0b" font-size="11" text-anchor="middle">并行度翻倍 → 0 提升</text>
+    <rect x="490" y="65" width="100" height="135" rx="4" fill="#22c55e"/>
+    <text x="540" y="57" fill="#22c55e" font-size="12" text-anchor="middle" font-weight="700">2.70万 (+17%)</text>
+    <g fill="#cdd9e5" font-size="11" text-anchor="middle">
+      <text x="180" y="220">D · 基线</text><text x="180" y="236">par12/batch500/pool2</text>
+      <text x="360" y="220">C · 并行度翻倍</text><text x="360" y="236">par24/batch2000/pool2</text>
+      <text x="540" y="220">E · sink 深度调优</text><text x="540" y="236">par24/batch4000/pool8</text>
+    </g>
+  </svg>
+</div>
+<table>
+  <thead><tr><th>组</th><th>并行度</th><th>batch</th><th>fetch</th><th>sink池</th><th>纯落库耗时</th><th>吞吐</th></tr></thead>
+  <tbody>
+    <tr><td>D · 当前基线</td><td class="num">12</td><td class="num">500</td><td class="num">2048</td><td class="num">2</td><td class="num">8.7 s</td><td class="num">2.31 万行/s</td></tr>
+    <tr><td>C · 并行度翻倍</td><td class="num">24</td><td class="num">2000</td><td class="num">8192</td><td class="num">2</td><td class="num">8.7 s</td><td class="num">2.31 万行/s（<b>0 提升</b>）</td></tr>
+    <tr><td>E · sink 深度调优</td><td class="num">24</td><td class="num">4000</td><td class="num">8192</td><td class="num">8</td><td class="num">7.4 s</td><td class="num">2.70 万行/s（<b>+17%</b>）</td></tr>
+  </tbody>
+</table>
+<div class="note"><b>瓶颈定位：</b>20 万行仅切出 25 个 split，并行度 12/24 都一两个波次读完，导出只占约 1s——
+<b>并行度翻倍收益为 0</b>；真正的墙是本机 6 核被「源 MySQL + 目标 MySQL + Flink」三家共享、以及单目标库
+~2.3 万行/s 的写入能力；sink 连接池 2→8 + batch 翻倍也只再挤出 +17%。
+与第一节「3015 张小表 ~3k 行/s」并不矛盾：<b>小表受单表 split 分配与 checkpoint 等待的固定开销支配，表越大速率越高</b>，
+大表才能跑满 sink 吞吐。</div>
+
+<h3>6.4 升级到 24 核 + 16G/32G 堆的收益预估</h3>
+<table>
+  <thead><tr><th>场景</th><th>当前（12 核实测）</th><th>24 核 + 大堆预估</th><th>依据</th></tr></thead>
+  <tbody>
+    <tr><td>增量单行延时</td><td class="num">3.0 s</td><td class="num ok"><b>~1.0 s</b></td><td>ckpt=1s 实测，与硬件无关</td></tr>
+    <tr><td>增量积压消化吞吐</td><td class="num">2.3 万行/s</td><td class="num">4–6 万行/s（~2×）</td><td>外推：24 真实核 + batch 2000–4000 + pool 4–8</td></tr>
+    <tr><td>大表全量（100 万行）</td><td class="num">~43 s 落库</td><td class="num">~20 s</td><td>同上外推</td></tr>
+    <tr><td>小表全量（≤10 万行）</td><td class="num">~15 s</td><td class="num">不变</td><td>机制开销主导，实测验证</td></tr>
+    <tr><td>多库多表翻倍场景</td><td class="num">splits&gt;12 时需分波次</td><td class="num">~2×</td><td>splits = 表数×chunk 数 ≥24 时一波完成；chunk 需调小至 2000–4000</td></tr>
+  </tbody>
+</table>
+<div class="note"><b>堆内存的角色是「使能项」而非直接提速：</b>16G/32G 堆允许 TaskManager 开到 4–8G——
+高并行度下 network/managed 内存不被反压掐住、大批次 buffer 不 OOM、G1 停顿占比下降使 1s checkpoint 的 barrier 更稳；
+JVM 启动需 <code>-Xmx</code> &gt; TM 内存 + 2G 余量。<b>所有场景的硬天花板是目标 MySQL 单实例写入能力</b>，
+若目标库不同步升级，提升将止步于目标库上限——那种情况应优先升级目标库或按库分治到多个目标实例。</div>
+
+<h3>6.5 新机器推荐配置（上线时一键应用）</h3>
+<table>
+  <thead><tr><th>参数</th><th>推荐值（24 核）</th><th>理由</th></tr></thead>
+  <tbody>
+    <tr><td><code>parallelism</code></td><td class="num">0（自动 = 24）</td><td>CPU 自动适配，留出运维弹性</td></tr>
+    <tr><td><code>snapshotChunkSize</code></td><td class="num">2000–4000</td><td>保证 splits ≥ 并行度，多表场景的关键杠杆</td></tr>
+    <tr><td><code>fetchSize</code> / <code>sinkBatchSize</code></td><td class="num">8192–16384 / 2000 起步</td><td>降低单条开销；观察目标库负载后再上调</td></tr>
+    <tr><td><code>sinkPoolSize</code></td><td class="num">4–8</td><td>实测 +17% 的直接杠杆</td></tr>
+    <tr><td><code>checkpointIntervalMs</code></td><td class="num">1000–2000</td><td>单行延时 3s → 1s 的唯一决定因素</td></tr>
+    <tr><td><code>taskmanagerMemory</code></td><td class="num">4096m（16G 堆）/ 8192m（32G 堆）</td><td>使能高并行 + 大批次</td></tr>
+    <tr><td><code>discoveryIntervalSec</code></td><td class="num">5–10</td><td>缩短新库发现延迟（小表全量唯一有效旋钮）</td></tr>
+  </tbody>
+</table>
+
+<p style="margin-top:18px">本报告的原始数据分别来自 <code>tests/perf-report.txt</code>、<code>tests/perf-storm-report.txt</code>、<code>tests/verify_perf_latency.py</code>（产物 <code>target/perf-latency.json</code>）、<code>tests/bench_live.py</code>（现场实测）与 <code>tests/bench_big.py</code>（大表缩放实验，日志 <code>tests/bench_big_C.log</code> / <code>bench_big_D.log</code> / <code>bench_big_E.log</code>），均可在本机 Docker 环境复跑。</p>
 
 <footer>
-  GeoDRSync 性能测试报告 · 数据基准日 2026-10-17 / 2026-10-18 · 引擎 Flink CDC 3.7 + Flink 2.2 MiniCluster · JVM -Xmx2g ·
+  GeoDRSync 性能测试报告 · 数据基准日 2026-10-17 / 2026-10-18 · 第六节硬件缩放实证补充于 2026-10-18 · 引擎 Flink CDC 3.7 + Flink 2.2 MiniCluster · JVM -Xmx2g ·
   源 127.0.0.1:13306 → 目标 127.0.0.1:13307（Docker）
 </footer>
 

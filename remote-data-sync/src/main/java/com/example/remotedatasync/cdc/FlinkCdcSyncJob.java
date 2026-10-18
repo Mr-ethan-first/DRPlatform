@@ -66,6 +66,20 @@ public class FlinkCdcSyncJob {
 
     private String jobId;
 
+    /** 全局启动序号：用于派生每次启动唯一的 server-id */
+    private static final java.util.concurrent.atomic.AtomicInteger SERVER_ID_SEQ =
+            new java.util.concurrent.atomic.AtomicInteger(0);
+
+    /**
+     * 派生本次启动的 server-id 区间："start-end"，区间宽度取 max(64, 并行度)，
+     * 保证任意并行度（≤64）下每个 source subtask 都有独立 server-id。
+     */
+    private static String serverIdRange(int serverIdBase, int parallelism) {
+        int span = Math.max(64, Math.max(1, parallelism));
+        int start = serverIdBase + (SERVER_ID_SEQ.getAndAdd(span) % 60000);
+        return start + "-" + (start + span - 1);
+    }
+
     private volatile String lastSavepointPath;
 
     public FlinkCdcSyncJob(String instanceKey, DatabaseMapping mapping, DRPlatformProperties.Cdc cfg) {
@@ -125,7 +139,8 @@ public class FlinkCdcSyncJob {
             throw new IllegalStateException("Job already running for " + instanceKey);
         }
         Configuration conf = new Configuration();
-        conf.setString("parallelism.default", String.valueOf(Math.max(1, cfg.getParallelism())));
+        int par = cfg.resolveParallelism();
+        conf.setString("parallelism.default", String.valueOf(par));
         conf.setString("execution.checkpointing.dir", toUri(checkpointDir));
         conf.setString("state.checkpoints.dir", toUri(checkpointDir));
         conf.setString("state.savepoints.dir", toUri(savepointDir));
@@ -135,7 +150,9 @@ public class FlinkCdcSyncJob {
         conf.set(RestartStrategyOptions.RESTART_STRATEGY, "fixed-delay");
         // 固定延迟重启：次数给足（目标库短暂不可达等故障可自愈），
         // 耗尽后由 FlinkCdcJobManager 的巡检线程兜底拉起作业
-        conf.setString("restart-strategy.fixed-delay.attempts", "20");
+        // 内部重启仅用于「秒级瞬时故障」自愈；对「恢复即必崩」的损坏态（如删表 DDL 导致的
+        // split 元数据损坏），内部重试纯属浪费时间，应尽早让位给外层巡检的 INITIAL 重扫自愈。
+        conf.setString("restart-strategy.fixed-delay.attempts", "5");
         conf.setString("restart-strategy.fixed-delay.delay", "5s");
         if (restorePath != null && !restorePath.isEmpty()) {
             conf.setString("execution.savepoint.path", restorePath);
@@ -162,7 +179,12 @@ public class FlinkCdcSyncJob {
                 .tableList(".*\\..*")
                 .username(mapping.getSourceUser())
                 .password(mapping.getSourcePassword())
-                .serverId(String.valueOf(cfg.getServerIdBase() + Math.abs(instanceKey.hashCode() % 10000)))
+                // server-id 每次启动原子分配一个 64 宽的区间块（flink-cdc 要求区间大小 ≥ 并行度，
+                // 单值区间只够 par≤2，par≥3 会抛 Subtask ID out of server id range）。
+                // 同一映射热切换/重启必得新块，避免与残留旧 binlog 连接的 id 冲突
+                // （MySQL 会踢掉重复 server-id 的 replica）；块分配取模回绕后才可能跨映射碰撞，
+                // 且碰撞后 watchdog 重启即得新块自愈。
+                .serverId(serverIdRange(cfg.getServerIdBase(), par))
                 .serverTimeZone(cfg.getServerTimeZone())
                 .splitSize(cfg.getSnapshotChunkSize())
                 .fetchSize(cfg.getFetchSize())
@@ -202,7 +224,9 @@ public class FlinkCdcSyncJob {
         String jobName = "cdc-" + instanceKey;
         this.jobClient = env.executeAsync(jobName);
         this.jobId = jobClient.getJobID().toString();
-        log.info("CDC job started: {} jobId={} restore={}", jobName, jobId, restorePath);
+        log.info("CDC job started: {} jobId={} restore={} parallelism={} ({})",
+                jobName, jobId, restorePath, cfg.resolveParallelism(),
+                cfg.getParallelism() > 0 ? "configured" : "auto by " + Runtime.getRuntime().availableProcessors() + " cpu cores");
     }
 
     // ===================== savepoint =====================
@@ -261,7 +285,16 @@ public class FlinkCdcSyncJob {
     // ===================== 恢复路径发现 =====================
 
     /**
-     * 找到最近一次可用的恢复路径：优先显式 savepoint，其次 retained checkpoint。
+     * 找到最近一次可用的恢复路径：<b>只用显式 savepoint</b>；无有效 savepoint 则返回 null
+     * （调用方退化为 INITIAL 全量重扫）。
+     * <p>
+     * <b>禁止用 retained checkpoint 做跨进程恢复</b>：实测 flink-cdc 3.7 从 checkpoint
+     * 恢复的 binlog split 缺表 schema 时会打印 {@code skip the table schema discovery}
+     * 并<b>静默丢弃后续全部数据事件</b>（位点照常推进、作业保持 RUNNING）——
+     * 形成「作业活着但目标零写入」的活僵尸，比崩溃危险得多。数据丢失 0 容忍下，
+     * 硬死（kill -9 / 断电）后一律 INITIAL 全量重扫（幂等 upsert 保证不重不丢）。
+     * 正常停止路径（stopWithSavepoint）会先落显式 savepoint，恢复无损。
+     * </p>
      *
      * @param recordedSavepoint 元库记录的 savepoint 路径（可为 null）
      */
@@ -271,7 +304,7 @@ public class FlinkCdcSyncJob {
                 && new File(recordedSavepoint, "_metadata").exists()) {
             return recordedSavepoint;
         }
-        return findLatestCheckpoint();
+        return null;
     }
 
     /** retained checkpoint 目录布局与 savepoint 相同（含 _metadata），可直接作为恢复路径 */

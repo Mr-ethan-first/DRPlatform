@@ -485,7 +485,8 @@ public class IdempotentMySqlSink extends org.apache.flink.streaming.api.function
     /** 目标/源连接 URL：db 放在路径段，参数在 ? 之后（避免库名被拼进 query string 损坏 URL） */
     private String jdbcUrl(DatabaseConfig cfg, String db) {
         String params = "useUnicode=true&characterEncoding=utf8&serverTimezone=" + serverZone.getId()
-                + "&allowPublicKeyRetrieval=true&useSSL=false&rewriteBatchedStatements=true";
+                + "&allowPublicKeyRetrieval=true&useSSL=false&rewriteBatchedStatements=true"
+                + "&connectTimeout=10000&socketTimeout=60000";
         return String.format("jdbc:mysql://%s:%d/%s?%s",
                 cfg.getHost(), cfg.getPort(), db == null ? "" : db, params);
     }

@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GeoDRSync 架构图与最终一致性说明</title>
+<style>
+  :root{
+    --bg:#f7f9fc; --ink:#1f2d3d; --muted:#5b6b7b; --line:#d8e0ea;
+    --prod:#4a90d9; --dr:#38a169; --app:#e0a030; --fail:#d9534f; --disk:#6b7280;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:"Segoe UI","Microsoft YaHei",-apple-system,system-ui,sans-serif;
+    line-height:1.65;font-size:15px}
+  .wrap{max-width:1120px;margin:0 auto;padding:32px 28px 64px}
+  h1{font-size:26px;margin:0 0 6px}
+  h2{font-size:20px;margin:38px 0 12px;padding-bottom:8px;border-bottom:2px solid var(--line)}
+  h3{font-size:16px;margin:22px 0 8px;color:#274463}
+  p{margin:8px 0}
+  .sub{color:var(--muted);margin:0 0 18px;font-size:14px}
+  .card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:18px 22px;margin:14px 0;
+    box-shadow:0 1px 3px rgba(20,40,80,.04)}
+  table{border-collapse:collapse;width:100%;margin:10px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
+  th{background:#eef4ff;color:#274463;font-weight:600}
+  code{background:#eef1f6;padding:1px 6px;border-radius:4px;font-size:13px;color:#b3402f}
+  .tag{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:600;color:#fff;margin-right:6px}
+  .t-prod{background:var(--prod)} .t-dr{background:var(--dr)} .t-app{background:var(--app)}
+  .t-fail{background:var(--fail)} .t-disk{background:var(--disk)}
+  ul{margin:6px 0 6px 18px;padding:0} li{margin:4px 0}
+  .legend{display:flex;flex-wrap:wrap;gap:14px;font-size:13px;color:var(--muted);margin:10px 0}
+  .legend span{display:inline-flex;align-items:center;gap:6px}
+  .sw{width:14px;height:14px;border-radius:3px;display:inline-block}
+  .note{background:#fff7e6;border:1px solid #ffe0a3;border-radius:8px;padding:10px 14px;font-size:13.5px;color:#7a5a10}
+  .ok{color:#2f8f4e;font-weight:600}
+  svg{display:block;width:100%;height:auto;max-width:1080px;margin:0 auto}
+  .footer{color:var(--muted);font-size:12.5px;margin-top:40px;text-align:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>GeoDRSync 异地灾备同步 — 架构与最终一致性设计</h1>
+<p class="sub">基于 Flink CDC（binlog 全量+增量）的 1:1 主机对同步引擎 · 版本对应 commit <code>63d7ac1</code> · 已通过 Docker 全自动化验证（基础14 / 进阶24 / 双向切换34 / 一致性8）</p>
+
+<!-- ===================== 架构图 ===================== -->
+<div class="card">
+<h2 style="margin-top:0;border:none">一、总体架构图</h2>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1060 840" font-family="Segoe UI, Microsoft YaHei, sans-serif">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#46586b"/>
+    </marker>
+    <marker id="arrR" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#d9534f"/>
+    </marker>
+    <marker id="arrG" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#38a169"/>
+    </marker>
+  </defs>
+
+  <!-- ===== 背景 ===== -->
+  <rect width="1060" height="840" fill="#f7f9fc"/>
+
+  <!-- ===== 标题 ===== -->
+  <text x="530" y="34" text-anchor="middle" font-size="21" font-weight="700" fill="#1f2d3d">GeoDRSync 异地灾备同步总体架构</text>
+
+  <!-- ===== 生产中心 ===== -->
+  <rect x="36" y="64" width="250" height="262" rx="12" fill="#eef4ff" stroke="#4a90d9" stroke-width="2"/>
+  <text x="161" y="90" text-anchor="middle" font-size="15" font-weight="700" fill="#2c5d9c">生产中心 (Production)</text>
+  <rect x="64" y="112" width="194" height="78" rx="8" fill="#ffffff" stroke="#4a90d9" stroke-width="1.5"/>
+  <text x="161" y="138" text-anchor="middle" font-size="13.5" font-weight="600" fill="#1f2d3d">主库 MySQL · 源 / Source</text>
+  <text x="161" y="160" text-anchor="middle" font-size="12" fill="#5b6b7b">127.0.0.1:13306</text>
+  <text x="161" y="178" text-anchor="middle" font-size="11" fill="#5b6b7b">开启 binlog(ROW/FULL)</text>
+  <rect x="64" y="210" width="194" height="78" rx="8" fill="#ffffff" stroke="#4a90d9" stroke-width="1.5"/>
+  <text x="161" y="236" text-anchor="middle" font-size="13.5" font-weight="600" fill="#1f2d3d">备库 MySQL · 备源 / Standby</text>
+  <text x="161" y="258" text-anchor="middle" font-size="12" fill="#5b6b7b">127.0.0.1:13308</text>
+  <text x="161" y="276" text-anchor="middle" font-size="11" fill="#5b6b7b">主库的实时副本</text>
+  <!-- 主->备 复制 -->
+  <path d="M161,190 C161,198 161,205 161,210" stroke="#4a90d9" stroke-width="1.6" stroke-dasharray="4 3" fill="none" marker-end="url(#arr)"/>
+  <text x="262" y="203" text-anchor="end" font-size="10.5" fill="#4a90d9">主备复制</text>
+
+  <!-- ===== 灾备中心 ===== -->
+  <rect x="774" y="64" width="250" height="190" rx="12" fill="#eafaef" stroke="#38a169" stroke-width="2"/>
+  <text x="899" y="90" text-anchor="middle" font-size="15" font-weight="700" fill="#23794a">灾备中心 (DR)</text>
+  <rect x="802" y="112" width="194" height="100" rx="8" fill="#ffffff" stroke="#38a169" stroke-width="1.5"/>
+  <text x="899" y="140" text-anchor="middle" font-size="13.5" font-weight="600" fill="#1f2d3d">灾备库 MySQL · 目标 / Target</text>
+  <text x="899" y="162" text-anchor="middle" font-size="12" fill="#5b6b7b">127.0.0.1:13307</text>
+  <text x="899" y="182" text-anchor="middle" font-size="11" fill="#5b6b7b">接收 upsert/delete</text>
+  <text x="899" y="200" text-anchor="middle" font-size="11" fill="#5b6b7b">库/表自动创建</text>
+
+  <!-- ===== GeoDRSync 应用 ===== -->
+  <rect x="320" y="64" width="420" height="690" rx="12" fill="#fff7ea" stroke="#e0a030" stroke-width="2"/>
+  <text x="530" y="90" text-anchor="middle" font-size="15" font-weight="700" fill="#9a6a08">GeoDRSync 同步引擎 (Spring Boot + 内嵌 Flink MiniCluster)</text>
+
+  <!-- 1. DatabaseSyncManager -->
+  <rect x="344" y="106" width="372" height="62" rx="8" fill="#ffffff" stroke="#e0a030" stroke-width="1.5"/>
+  <text x="530" y="128" text-anchor="middle" font-size="13" font-weight="600" fill="#1f2d3d">DatabaseSyncManager</text>
+  <text x="530" y="146" text-anchor="middle" font-size="11" fill="#5b6b7b">映射/角色管理 · 主备切换 · 方向反转(reverse) · 角色持久化</text>
+
+  <!-- 2. FlinkCdcJobManager -->
+  <rect x="344" y="180" width="372" height="58" rx="8" fill="#ffffff" stroke="#e0a030" stroke-width="1.5"/>
+  <text x="530" y="200" text-anchor="middle" font-size="13" font-weight="600" fill="#1f2d3d">FlinkCdcJobManager</text>
+  <text x="530" y="218" text-anchor="middle" font-size="11" fill="#5b6b7b">作业生命周期 · watchdog 巡检(动态新增库表/失败自愈) · 元库 cdc_job_state</text>
+
+  <!-- 3. Pipeline 纵向 -->
+  <rect x="344" y="252" width="372" height="46" rx="8" fill="#eef6ff" stroke="#4a90d9" stroke-width="1.3"/>
+  <text x="530" y="270" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1f2d3d">MySqlSource</text>
+  <text x="530" y="288" text-anchor="middle" font-size="10.5" fill="#5b6b7b">binlog 快照(r)+增量(c/u,d) · StartupOptions.initial</text>
+
+  <rect x="344" y="312" width="372" height="42" rx="8" fill="#eef6ff" stroke="#4a90d9" stroke-width="1.3"/>
+  <text x="530" y="338" text-anchor="middle" font-size="12" font-weight="600" fill="#1f2d3d">JsonToCdcEventFunction · 解析 + 解包 historyRecord DDL</text>
+
+  <rect x="344" y="368" width="372" height="42" rx="8" fill="#eef6ff" stroke="#4a90d9" stroke-width="1.3"/>
+  <text x="530" y="394" text-anchor="middle" font-size="12" font-weight="600" fill="#1f2d3d">CdcFilter · ignore-databases/tables/ddl-tables</text>
+
+  <rect x="344" y="424" width="372" height="40" rx="8" fill="#eef6ff" stroke="#4a90d9" stroke-width="1.3"/>
+  <text x="530" y="449" text-anchor="middle" font-size="12" font-weight="600" fill="#1f2d3d">keyBy(tableKey) · 同表保序(含 DDL)</text>
+
+  <rect x="344" y="478" width="372" height="92" rx="8" fill="#fff0d6" stroke="#e0a030" stroke-width="1.6"/>
+  <text x="530" y="500" text-anchor="middle" font-size="13" font-weight="700" fill="#9a6a08">IdempotentMySqlSink</text>
+  <text x="530" y="518" text-anchor="middle" font-size="11" fill="#5b6b7b">checkpoint 屏障对齐 flushAll · EXACTLY_ONCE</text>
+  <text x="530" y="536" text-anchor="middle" font-size="11" fill="#5b6b7b">upsert(ON DUPLICATE KEY) / delete(&lt;=&gt; 镜像) · 幂等</text>
+  <text x="530" y="554" text-anchor="middle" font-size="11" fill="#5b6b7b">字段转换(TransformRule) · 目标库/表懒创建</text>
+
+  <rect x="344" y="584" width="372" height="56" rx="8" fill="#eafaef" stroke="#38a169" stroke-width="1.4"/>
+  <text x="530" y="604" text-anchor="middle" font-size="12.5" font-weight="600" fill="#23794a">DdlApplier · DDL 清洗 + 幂等重放</text>
+  <text x="530" y="622" text-anchor="middle" font-size="10.5" fill="#5b6b7b">去库限定符 · 0900_*→general_ci · IF NOT EXISTS</text>
+  <text x="530" y="636" text-anchor="middle" font-size="10.5" fill="#5b6b7b">1050/1007/1060/1061/1091 跳过</text>
+
+  <rect x="344" y="652" width="372" height="44" rx="8" fill="#f0f1f4" stroke="#6b7280" stroke-width="1.3"/>
+  <text x="530" y="672" text-anchor="middle" font-size="12" font-weight="600" fill="#374151">元库 DRPlatform · sync_progress / cdc_job_state</text>
+  <text x="530" y="689" text-anchor="middle" font-size="10.5" fill="#5b6b7b">角色变更持久化 geodrsync-dynamic-mappings.json</text>
+
+  <!-- ===== 本地磁盘 ===== -->
+  <rect x="350" y="770" width="360" height="56" rx="8" fill="#eef1f4" stroke="#6b7280" stroke-width="1.4"/>
+  <text x="530" y="792" text-anchor="middle" font-size="12" font-weight="600" fill="#374151">本地磁盘 savepoints/checkpoints</text>
+  <text x="530" y="810" text-anchor="middle" font-size="10.5" fill="#5b6b7b">RETAIN_ON_CANCELLATION · 崩溃/重启/切换恢复位点</text>
+
+  <!-- ===== 数据流箭头 ===== -->
+  <!-- 主库 -> App (binlog) -->
+  <path d="M286,151 C303,151 306,151 320,151" stroke="#46586b" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="303" y="143" text-anchor="middle" font-size="10.5" fill="#46586b">binlog 抓取(CDC)</text>
+  <!-- App sink -> 灾备库 -->
+  <path d="M740,524 C754,524 757,524 774,524" stroke="#46586b" stroke-width="2" fill="none" marker-end="url(#arrG)"/>
+  <text x="757" y="516" text-anchor="middle" font-size="10.5" fill="#23794a">upsert/delete</text>
+  <!-- 灾备库 -> 主库 reverse (虚线跨应用) -->
+  <path d="M802,180 C700,250 600,250 520,250 C420,250 360,140 286,140"
+        stroke="#d9534f" stroke-width="2" stroke-dasharray="6 4" fill="none" marker-end="url(#arrR)"/>
+  <text x="540" y="240" text-anchor="middle" font-size="11" fill="#d9534f">reverse 反向同步（灾备切生产 / 生产切灾备）</text>
+  <!-- App -> 磁盘 -->
+  <path d="M530,696 C530,710 530,718 530,770" stroke="#46586b" stroke-width="1.8" stroke-dasharray="4 3" fill="none" marker-end="url(#arr)"/>
+
+  <!-- ===== 图例 ===== -->
+  <g font-size="11" fill="#5b6b7b">
+    <rect x="36" y="356" width="14" height="14" rx="3" fill="#4a90d9"/><text x="56" y="368">生产/源</text>
+    <rect x="120" y="356" width="14" height="14" rx="3" fill="#38a169"/><text x="140" y="368">灾备/目标</text>
+    <rect x="214" y="356" width="14" height="14" rx="3" fill="#e0a030"/><text x="234" y="368">应用引擎</text>
+    <rect x="36" y="378" width="14" height="14" rx="3" fill="#d9534f"/><text x="56" y="390">故障切换/反向</text>
+    <rect x="160" y="378" width="14" height="14" rx="3" fill="#6b7280"/><text x="180" y="390">磁盘/元库</text>
+  </g>
+</svg>
+<div class="legend">
+  <span><i class="sw" style="background:#4a90d9"></i>生产/源</span>
+  <span><i class="sw" style="background:#38a169"></i>灾备/目标</span>
+  <span><i class="sw" style="background:#e0a030"></i>应用引擎</span>
+  <span><i class="sw" style="background:#d9534f"></i>故障切换/反向</span>
+  <span><i class="sw" style="background:#6b7280"></i>磁盘/元库</span>
+</div>
+<p class="sub" style="margin-top:4px">同步方向：<b>生产主库(13306) → GeoDRSync → 灾备库(13307)</b>；备源(13308)是主库的实时副本，主库故障时可切换为源。灾备库经 <code>/sync/mapping/reverse</code> 可整体反向成为新生产中心。</p>
+</div>
+
+<!-- ===================== 一致性总览 ===================== -->
+<div class="card">
+<h2 style="margin-top:0;border:none">二、最终一致性的总体保证</h2>
+<p>本系统以 <b>Flink CDC 的 checkpoint 屏障对齐</b> 为基石，配合 <b>幂等写入</b>（upsert / NULL-safe delete）、<b>同表 keyBy 保序</b>、<b>DDL 与行事件同键并先 flush 再改结构</b>、以及 <b>恢复路径优先级（savepoint &gt; retained checkpoint &gt; INITIAL 兜底）</b>，在 DML / DDL / 断电 / 断网 / 主备切换 / 方向反转 各类场景下实现 <span class="ok">不丢、不重、最终一致</span>。</p>
+
+<div class="note"><b>一句话恢复优先级：</b> <code>显式 savepoint（元库记录）</code> → <code>retained checkpoint（RETAIN_ON_CANCELLATION 保留）</code> → <code>INITIAL 全量重扫兜底</code>。checkpoint 目录按 <code>chk-N</code> <b>数值排序</b>选取最新位点（修复过字符串排序把 chk-9 排到 chk-45 之后选旧位点的 bug）。</div>
+</div>
+
+<!-- ===================== DML ===================== -->
+<div class="card">
+<h2 style="margin-top:0;border:none">三、DML（INSERT / UPDATE / DELETE）一致性</h2>
+<h3>1. 捕获与解析</h3>
+<ul>
+  <li><code>MySqlSource</code> 以 <code>StartupOptions.initial()</code> 启动：先整库<b>快照</b>（事件 <code>op=r</code>），快照结束无缝衔接 <b>binlog 增量</b>（<code>c/u/d</code>）。</li>
+  <li><code>JsonToCdcEventFunction</code> 把 Debezium JSON 解析为 <code>CdcEvent(before / after / op / source.ts_ms)</code>，作为后续所有语义的输入。</li>
+</ul>
+<h3>2. 写入语义（幂等核心）</h3>
+<table>
+  <tr><th>操作</th><th>落库语句</th><th>幂等性说明</th></tr>
+  <tr><td>写 / 更新 / 快照</td><td><code>INSERT ... ON DUPLICATE KEY UPDATE</code></td><td>按整行 <code>after</code> 做 upsert；重放同一行无副作用（覆盖自身）。</td></tr>
+  <tr><td>删除</td><td><code>DELETE FROM t WHERE (before 列 &lt;=&gt; ?) OR ...</code></td><td>用 before 镜像 + NULL-safe 等值（<code>&lt;=&gt;</code>）匹配，<b>无需主键知识</b>；删不存在的行无副作用。</td></tr>
+</table>
+<h3>3. 顺序与屏障对齐（不丢不重的关键）</h3>
+<ul>
+  <li><b>同表保序：</b><code>keyBy(tableKey)</code> 把同一 <code>库.表</code> 的全部行事件 + DDL 路由到同一 subtask，严格保持 binlog 相对顺序。</li>
+  <li><b>DDL 与行同键：</b>sink 处理 DDL 前先 <code>flushAll()</code> 落盘该 subtask 全部待写数据，再执行结构变更 —— 保证「结构变更前的所有数据已落地，再改结构」。</li>
+  <li><b>checkpoint 屏障对齐（EXACTLY_ONCE）：</b><code>snapshotState()</code> 在 checkpoint 屏障到达时<b>同步 flush 全部缓冲</b>，屏障在「上游事件已全部处理且落库」后才通过 → <b>已确认的 binlog 位点永不越过未落库数据</b>。崩溃后从 checkpoint 位点重放，upsert/delete 幂等 → 不丢不重。</li>
+  <li><b>延迟监控：</b><code>CdcLagRegistry</code> 统计 <code>source.ts_ms</code> 与落库时间差，超过 <code>lagWarnSeconds=10s</code> 告警。</li>
+</ul>
+</div>
+
+<!-- ===================== DDL ===================== -->
+<div class="card">
+<h2 style="margin-top:0;border:none">四、DDL（CREATE / DROP / ALTER / TRUNCATE / RENAME）一致性</h2>
+<h3>1. 捕获</h3>
+<ul>
+  <li><code>includeSchemaChanges=true</code>。快照阶段 DDL 在顶层 <code>ddl</code> 字段；<b>binlog 阶段 schema-change 事件的 DDL 藏在 <code>historyRecord</code>（JSON-in-string）</b> → <code>unwrapHistoryRecord</code> 解包回填 <code>ddl/databaseName</code>。</li>
+  <li><code>extractTable</code> 从 DDL 文本提取表名作为 <code>keyBy</code> 键，保证 DDL 与同行数据同序。</li>
+</ul>
+<h3>2. 应用与清洗（DdlApplier）</h3>
+<table>
+  <tr><th>清洗规则</th><th>目的</th></tr>
+  <tr><td>去除库限定符 <code>`db`.</code></td><td>目标端按当前库执行（源/目标库名不同也能套用）。</td></tr>
+  <tr><td><code>utf8mb4_0900_*</code> → <code>utf8mb4_general_ci</code></td><td>源 8.0 专有排序规则，目标 5.7 不认 → 降级可移植。</td></tr>
+  <tr><td><code>CREATE TABLE/DB</code> 补 <code>IF NOT EXISTS</code></td><td>savepoint 恢复重放 DDL 时幂等。</td></tr>
+  <tr><td>跳过 USE/SET/FLUSH/SAVEPOINT/事务类会话语句</td><td>会话级语句不同步到目标。</td></tr>
+</table>
+<h3>3. 幂等重放</h3>
+<p>恢复时位点<b>前后</b>的 DDL 会被重放一次，目标已生效的结构变更会报「已存在/不存在」类错误，按成功处理跳过：<code>1050</code>(表已存在) / <code>1007</code>(库已存在) / <code>1060</code>(列重复) / <code>1061</code>(键名重复) / <code>1091</code>(列不存在，DROP)。</p>
+<h3>4. 目标库 / 表懒创建</h3>
+<ul>
+  <li><b>新增库：</b>sink <code>ensureTargetDatabase</code> 自动 <code>CREATE DATABASE IF NOT EXISTS</code>（修复「目标库不存在 → 作业 FAILED 耗尽重启」）。</li>
+  <li><b>新增表：</b><code>ensureTargetTable</code> 查 <code>information_schema</code>，缺失则从源 <code>SHOW CREATE TABLE</code> 经 <code>DdlApplier.sanitize</code> 后建表。</li>
+</ul>
+<h3>5. 动态新增库/表发现（运行期）</h3>
+<p>flink-cdc 的 <code>scanNewlyAddedTable</code> 只在作业 open()/恢复时探测<b>一次</b>，运行期不自动发现。由 <code>FlinkCdcJobManager.watchdog</code> 周期（<code>discoveryIntervalSec=20s</code>）扫描源库与基线 <code>capturedTables</code> 对比，发现新增后<b>打 savepoint → 重启纳入</b>。两个关键修正：</p>
+<ul>
+  <li>基线在 <code>job.start()</code> 之后<b>立即</b>取，否则「启动瞬间新建的表」被误记基线而永不发现；</li>
+  <li>基线<b>只在重启真正成功后</b>更新，否则被冷却期（<code>discoveryRestartCooldownSec=60s</code>）跳过的发现会永久丢失。</li>
+</ul>
+<h3>6. 目标端缺表补齐</h3>
+<p>watchdog 对比目标端，<b>源有目标无</b>：空表 <code>tryCreateEmptyTable</code> 直接复制建表（CDC 不产生行事件不会建）；非空表（首轮全量中途崩溃）触发 <code>forceInitial</code> 全量重扫，重试上限 <b>3 次</b> 防重启风暴。</p>
+<h3>7. TRUNCATE / RENAME / 字段转换</h3>
+<ul>
+  <li><b>TRUNCATE：</b>作为 DDL 重放，目标执行 truncate 清空（与目标数据一致）。</li>
+  <li><b>RENAME：</b>CDC 中以 drop+create 组合出现，目标端按新建表同步；旧表若保留为独立表则各自同步。</li>
+  <li><b>字段转换：</b><code>TransformRule</code>（db/table 支持 <code>*</code> 通配，仅非主键列、字符串等值）在 sink <code>applyTransforms</code> 对 <code>after/before</code> 应用 → 源库原值不变，目标库写转换值（例 <code>secret→MASKED</code>）。只改非主键，避免破坏 upsert 幂等键。</li>
+</ul>
+</div>
+
+<!-- ===================== 断电 ===================== -->
+<div class="card">
+<h2 style="margin-top:0;border:none">五、断电场景一致性</h2>
+<h3>1. 应用进程强杀（kill -9 / 宕机）</h3>
+<ul>
+  <li>重启后 <code>FlinkCdcJobManager</code> 按优先级恢复：<b>显式 savepoint（元库 cdc_job_state）→ retained checkpoint（RETAIN_ON_CANCELLATION 保留）→ INITIAL 全量兜底</b>。</li>
+  <li>恢复路径失效（checkpoint 损坏/被删）→ <code>startInternal</code> 退化为 <b>INITIAL 全量重扫</b>（代价一次全量，优于彻底停同步）。</li>
+  <li><b>角色持久化：</b>换源/换向后写入 <code>geodrsync-dynamic-mappings.json</code>，重启后新方向<b>优先于 yml 生效</b>，防止「故障切换被静默回滚」。</li>
+  <li>优雅停机 <code>@PreDestroy</code>：对所有作业 <code>stopWithSavepoint</code>（落安全点再停）。</li>
+</ul>
+<h3>2. 目标库断电（docker stop / 宕机）</h3>
+<ul>
+  <li>sink 写目标失败 → Flink <b>固定延迟重启策略</b>（<code>attempts=20, delay=5s</code>）自愈；耗尽 → <code>watchdog</code> 拉起作业。</li>
+  <li>恢复后从最近 checkpoint 位点<b>续传</b>（不会重全量），upsert/delete 幂等 → 行数精确一致（实测 18/18、28/28 收敛）。</li>
+</ul>
+<h3>3. 源库断电</h3>
+<p>CDC 源连接中断 → <code>MySqlSource</code> 内部重连（<code>connectMaxRetries=3</code>）；binlog 位点<b>不前进</b>，恢复后从原位点续读，不丢数据。</p>
+</div>
+
+<!-- ===================== 断网 ===================== -->
+<div class="card">
+<h2 style="margin-top:0;border:none">六、断网场景一致性</h2>
+<p>网络分区/断网本质 = 管道中断，与断电走同一套<b>重连 / 重启 / 续传</b>机制：</p>
+<table>
+  <tr><th>断网位置</th><th>表现</th><th>一致性保证</th></tr>
+  <tr><td>源库断网（pause）</td><td>源不可达，source 暂停拉取，位点不变</td><td>恢复后从断点续读（实测源断网 25s 恢复，新增 5 行 5s 到达，全库一致）</td></tr>
+  <tr><td>目标库断网（pause）</td><td>sink 写失败</td><td>Flink 重启 + watchdog 拉起，恢复后续传，行数精确一致</td></tr>
+  <tr><td>应用↔元库 / 目标跨网络断</td><td>同目标断电处理</td><td>作业拉起后从 checkpoint 续传</td></tr>
+</table>
+<div class="note"><b>运维注意：</b>本系统同步在单机 Docker 多端口；跨机房断网即对应「源或目标主机不可达」，由上述机制兜底。测试/运维通过 <code>curl --noproxy "*"</code> / <code>requests(trust_env=False)</code> 访问，避免本地代理把 <code>127.0.0.1</code> 误发代理（已踩坑：代理返回 502 被误判为服务未就绪）。</div>
+</div>
+
+<!-- ===================== 切换 ===================== -->
+<div class="card">
+<h2 style="margin-top:0;border:none">七、主备切换 / 方向反转（failover & failback）一致性</h2>
+<h3>1. 主备切换 switchSourceToStandby（同中心 主↔备）</h3>
+<ol>
+  <li>停旧作业 → 释放旧源连接池（必须用<b>旧 instanceKey</b> 停，换源后 key 含端口会变）；</li>
+  <li><b>源↔备源地址交换</b>（可反复来回切换）；</li>
+  <li><b>主键对齐</b>；</li>
+  <li>新源以 <b>INITIAL 全量重扫</b>（换源后旧 binlog 位点作废，绝不可用 <code>startOrResume</code> 用旧位点续读，否则漏数据或 FAILED）。</li>
+</ol>
+<h3>2. 方向反转 reverseDirection（灾备↔生产）</h3>
+<ul>
+  <li>交换 <code>source ↔ target</code>（含 user/password），<b>备源地址不变</b>（挂在源侧）→ <b>调用两次必然回到初始状态（可逆）</b>。</li>
+  <li>用 <code>onSourceSwitched</code> → INITIAL 全量重扫；方向持久化 <code>geodrsync-dynamic-mappings.json</code>（重启不回退）。</li>
+  <li>典型：<b>灾备切生产（failover）</b> / <b>生产切灾备（failback）</b>。</li>
+</ul>
+<h3>3. 主键对齐 alignSourceAutoIncrement（防真实丢失的关键）</h3>
+<p>新源 <code>AUTO_INCREMENT</code> 必须 <b>&gt; 目标端已存在主键 MAX</b>。否则新写入复用旧 id，upsert 按主键覆盖「不同业务行」→ <b>真实数据丢失</b>。实现：对每个单列主键表比较 <code>目标 MAX(pk)</code> 与 <code>新源 MAX(pk)</code>，若新源落后则 <code>ALTER TABLE ... AUTO_INCREMENT = 目标MAX+1</code>（只改元数据、不锁行）。由 <code>ha.auto-align-source-autoincrement=true</code> 控制（默认开）。</p>
+<h3>4. 切换前后数据一致性判定口径</h3>
+<div class="note">切换是「<b>灾备 ⊇ 备源</b>」的<b>超集</b>关系：备库只到克隆/切换时刻，灾备目标还保留主库故障前的尾部写入；<b>CDC 不做删除对账</b> → 切回主源后灾备比生产多出的故障期写入是<b>正确保留</b>，不是数据丢失。验证脚本用 <code>wait_superset</code> 而非 identical 判定（反向 &lt; 才代表真实丢失）。切换前后数据不丢：切前源行数在目标端完整保留（实测 31→37 等）。</div>
+</div>
+
+<!-- ===================== 参数 ===================== -->
+<div class="card">
+<h2 style="margin-top:0;border:none">八、关键一致性参数（DRPlatformProperties）</h2>
+<table>
+  <tr><th>配置项</th><th>默认值</th><th>一致性作用</th></tr>
+  <tr><td><code>cdc.checkpointIntervalMs</code></td><td>3000</td><td>checkpoint 周期，决定崩溃恢复粒度（位点越新，重放越少）。</td></tr>
+  <tr><td><code>cdc.includeSchemaChanges</code></td><td>true</td><td>是否同步 DDL（表结构变更）。</td></tr>
+  <tr><td><code>cdc.scanNewlyAddedTable</code> + <code>discoveryIntervalSec</code> + <code>discoveryRestartCooldownSec</code></td><td>true / 20s / 60s</td><td>运行期新增库表发现 + 重启冷却防风暴。</td></tr>
+  <tr><td><code>cdc.sinkBatchSize</code> / <code>sinkPoolSize</code></td><td>500 / 2</td><td>sink 批大小与目標库连接池上限。</td></tr>
+  <tr><td><code>cdc.serverTimeZone</code></td><td>UTC</td><td><b>必须与源库一致</b>，否则 DATETIME/TIMESTAMP 整体偏移。</td></tr>
+  <tr><td><code>cdc.lagWarnSeconds</code></td><td>10</td><td>同步延迟告警阈值。</td></tr>
+  <tr><td><code>ha.autoAlignSourceAutoIncrement</code></td><td>true</td><td>切换时对齐自增位点，防 upsert 覆盖真实丢失。</td></tr>
+  <tr><td><code>ha.fullResyncAfterSwitch</code></td><td>true</td><td>切换后强制新源全量重扫，防水位复用导致漏同步。</td></tr>
+  <tr><td><code>engine.postStartReconcileGraceMs</code></td><td>180000</td><td>轮询模式删除对账静默期（防误删备库尚未追平的数据）。</td></tr>
+  <tr><td><code>engine.reconcileDeleteConfirmRounds</code></td><td>3</td><td>轮询模式删除对账连续确认轮数（防抖动误删）。</td></tr>
+  <tr><td><code>restart-strategy.fixed-delay.attempts/delay</code></td><td>20 / 5s</td><td>Flink 作业内置重启自愈上限。</td></tr>
+  <tr><td><code>execution.checkpointing.externalized-checkpoint-retention</code></td><td>RETAIN_ON_CANCELLATION</td><td>作业取消后保留 checkpoint，重启可从最近位点续传。</td></tr>
+</table>
+</div>
+
+<p class="footer">GeoDRSync · 基于 Flink CDC 2.2 / flink-cdc 3.7 · 本说明与架构图对应 commit 63d7ac1，已通过 Docker 全自动化验证。</p>
+</div>
+</body>
+</html>

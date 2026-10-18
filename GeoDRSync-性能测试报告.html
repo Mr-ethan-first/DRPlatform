@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GeoDRSync 性能测试报告 · 全量同步速度 & 实时同步时效性</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#171c24; --panel2:#1f2630; --line:#2b333f;
+    --txt:#e6edf3; --sub:#9aa7b4; --acc:#E50914; --acc2:#3b82f6;
+    --ok:#22c55e; --warn:#f59e0b; --grid:#273140;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font-family:-apple-system,"Segoe UI","Microsoft YaHei",Roboto,Helvetica,Arial,sans-serif;
+    line-height:1.65;font-size:15px}
+  .wrap{max-width:1080px;margin:0 auto;padding:32px 24px 80px}
+  header{border-bottom:2px solid var(--acc);padding-bottom:18px;margin-bottom:28px}
+  h1{font-size:27px;margin:0 0 6px;letter-spacing:.5px}
+  h1 .tag{color:var(--acc)}
+  .meta{color:var(--sub);font-size:13px}
+  h2{font-size:20px;margin:42px 0 14px;padding-left:12px;border-left:4px solid var(--acc)}
+  h3{font-size:16px;margin:24px 0 10px;color:#cdd9e5}
+  p{color:#d6dee7}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;margin:18px 0}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+  .card .k{font-size:12px;color:var(--sub);letter-spacing:.4px}
+  .card .v{font-size:25px;font-weight:700;margin-top:6px}
+  .card .v small{font-size:13px;color:var(--sub);font-weight:500}
+  .card .d{font-size:12px;color:var(--sub);margin-top:4px}
+  .accent{color:var(--acc)} .blue{color:var(--acc2)} .ok{color:var(--ok)}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:9px 12px;text-align:left}
+  th{background:var(--panel2);color:#cdd9e5;font-weight:600}
+  td.num{font-variant-numeric:tabular-nums;text-align:right}
+  tr:nth-child(even) td{background:#141922}
+  .note{background:var(--panel);border:1px dashed var(--line);border-radius:10px;
+    padding:14px 16px;margin:16px 0;color:var(--sub);font-size:13.5px}
+  .note b{color:#cdd9e5}
+  .chartbox{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:18px;margin:18px 0}
+  .legend{display:flex;gap:18px;flex-wrap:wrap;font-size:13px;color:var(--sub);margin-top:6px}
+  .legend i{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+  code{background:#0b0e13;border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:13px;color:#e7b3b7}
+  .pill{display:inline-block;background:#22151a;color:var(--acc);border:1px solid #3a1c22;
+    border-radius:999px;padding:2px 10px;font-size:12px;margin:2px 4px 2px 0}
+  footer{margin-top:50px;border-top:1px solid var(--line);padding-top:16px;color:var(--sub);font-size:12.5px}
+  ul{color:#d6dee7} li{margin:4px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>GeoDRSync 性能测试报告 <span class="tag">· 全量同步速度 &amp; 实时同步时效性</span></h1>
+  <div class="meta">GeoDRSync（基于 Flink CDC 3.7 / Flink 2.2 MiniCluster 的异地灾备同步引擎） ·
+  测试环境：本机 Docker（源 13306 → 目标 13307，元库 3306）· 报告生成 2026-10-18</div>
+</header>
+
+<!-- ============ KPI ============ -->
+<div class="cards">
+  <div class="card"><div class="k">全量同步规模</div><div class="v">3015 <small>表</small></div><div class="d">45 库 × 67 表，约 157 万行</div></div>
+  <div class="card"><div class="k">全量同步耗时</div><div class="v">509 <small>s</small></div><div class="d">≈ 8.5 分钟收敛</div></div>
+  <div class="card"><div class="k">全量平均速率</div><div class="v">~3029 <small>行/s</small></div><div class="d">稳定段 3.3k–3.6k 行/s</div></div>
+  <div class="card"><div class="k">实时延迟 p99</div><div class="v accent">3.7 <small>s</small></div><div class="d">受 3s checkpoint 间隔约束</div></div>
+  <div class="card"><div class="k">DDL 同步 p50</div><div class="v blue">0.31 <small>s</small></div><div class="d">ADD COLUMN 结构传播</div></div>
+  <div class="card"><div class="k">增量风暴</div><div class="v ok">存活 <small>无 OOM</small></div><div class="d">180s 持续写入不崩</div></div>
+</div>
+
+<div class="note">
+  <b>测试口径说明：</b>
+  <span class="pill">全量同步速度</span> 来自 2026-10-17 的 45 库大规模压测（perflab profile，同一 Docker 引擎、同一份代码）；
+  <span class="pill">实时同步时效性</span> 来自 2026-10-18 的端到端延迟基准（默认 profile，geo_source.t_order）；
+  <span class="pill">增量风暴</span> 来自 2026-10-17 的补测。三者均为真实运行数据，非理论估算。
+  全量速率按 information_schema 行数近似值计算；延迟为「源库事务提交 → 目标库可见」的端到端墙钟时间。
+</div>
+
+<!-- ============ 1. 全量同步速度 ============ -->
+<h2>一、全量同步速度（Initial Snapshot）</h2>
+<p>全量同步指作业首次启动或换源后以 <code>INITIAL</code> 模式对源端所有库表做快照读取并写入目标端。
+下表为 45 库 / 3015 表 / 约 157 万行的规模化实测，按水位表进度采样：</p>
+
+<table>
+  <thead><tr><th>已用时间(s)</th><th>已完成表</th><th>目标端累计行(万)</th><th>瞬时均速(行/s)</th></tr></thead>
+  <tbody>
+    <tr><td class="num">32</td><td class="num">162 / 3015</td><td class="num">12.1</td><td class="num">3810</td></tr>
+    <tr><td class="num">63</td><td class="num">324</td><td class="num">21.1</td><td class="num">3324</td></tr>
+    <tr><td class="num">95</td><td class="num">486</td><td class="num">32.3</td><td class="num">3387</td></tr>
+    <tr><td class="num">127</td><td class="num">648</td><td class="num">43.7</td><td class="num">3443</td></tr>
+    <tr><td class="num">159</td><td class="num">810</td><td class="num">54.7</td><td class="num">3445</td></tr>
+    <tr><td class="num">190</td><td class="num">1026</td><td class="num">67.0</td><td class="num">3521</td></tr>
+    <tr><td class="num">222</td><td class="num">1134</td><td class="num">76.7</td><td class="num">3456</td></tr>
+    <tr><td class="num">254</td><td class="num">1350</td><td class="num">88.6</td><td class="num">3489</td></tr>
+    <tr><td class="num">286</td><td class="num">1566</td><td class="num">101.6</td><td class="num">3555</td></tr>
+    <tr><td class="num">316</td><td class="num">1728</td><td class="num">112.2</td><td class="num">3545</td></tr>
+    <tr><td class="num">347</td><td class="num">1890</td><td class="num">123.2</td><td class="num">3545</td></tr>
+    <tr><td class="num">378</td><td class="num">1998</td><td class="num">132.6</td><td class="num">3512</td></tr>
+    <tr><td class="num">409</td><td class="num">2214</td><td class="num">143.1</td><td class="num">3496</td></tr>
+    <tr><td class="num">441</td><td class="num">2376</td><td class="num">155.6</td><td class="num">3525</td></tr>
+    <tr><td class="num">473</td><td class="num">2430</td><td class="num">155.7</td><td class="num">3069</td></tr>
+    <tr><td class="num">509</td><td class="num">3015（全完成）</td><td class="num">157.0</td><td class="num">3029（均值）</td></tr>
+  </tbody>
+</table>
+
+<div class="chartbox">
+  <div style="font-weight:600;margin-bottom:8px">全量同步累计行数 vs 时间（红：累积曲线）</div>
+  <svg viewBox="0 0 680 320" width="100%" preserveAspectRatio="xMidYMid meet" role="img" aria-label="全量同步累积曲线">
+    <!-- grid -->
+    <g stroke="#273140" stroke-width="1">
+      <line x1="60" y1="30" x2="60" y2="280"/><line x1="60" y1="280" x2="650" y2="280"/>
+      <line x1="60" y1="230" x2="650" y2="230"/><line x1="60" y1="180" x2="650" y2="180"/>
+      <line x1="60" y1="130" x2="650" y2="130"/><line x1="60" y1="80" x2="650" y2="80"/>
+      <line x1="60" y1="30" x2="650" y2="30"/>
+    </g>
+    <g fill="#9aa7b4" font-size="11">
+      <text x="40" y="284">0</text><text x="34" y="234">31万</text><text x="34" y="184">63万</text>
+      <text x="34" y="134">94万</text><text x="34" y="84">125万</text><text x="28" y="34">157万</text>
+      <text x="55" y="298">0s</text><text x="320" y="298">255s</text><text x="615" y="298">509s</text>
+    </g>
+    <polyline fill="none" stroke="#E50914" stroke-width="2.5"
+      points="60,280 97,261 133,246 170,229 207,210 244,193 280,173 317,158 354,139 391,118 426,101 462,84 498,69 534,52 571,32 608,32 650,30"/>
+    <g fill="#E50914"><circle cx="650" cy="30" r="3.5"/></g>
+    <text x="650" y="22" fill="#E50914" font-size="11" text-anchor="end">157.0万 / 509s</text>
+  </svg>
+  <div class="legend"><span><i style="background:#E50914"></i>目标端累计同步行数（万）</span></div>
+</div>
+
+<table>
+  <thead><tr><th>指标</th><th>实测值</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td>总耗时</td><td class="num">509 s</td><td>应用就绪 → 3015 表全部落库</td></tr>
+    <tr><td>平均速率</td><td class="num">~3029 行/s</td><td>目标端行数 / 耗时（行数近似）</td></tr>
+    <tr><td>稳定段速率</td><td class="num">3.3k–3.6k 行/s</td><td>中段（95s–441s）几乎恒定</td></tr>
+    <tr><td>峰值 JVM 堆</td><td class="num">410 / 2048 MB</td><td>仅 20%，远低于上限</td></tr>
+    <tr><td>峰值活动线程</td><td class="num">6153</td><td>Flink 多并行度 + 连接池</td></tr>
+    <tr><td>OOM</td><td class="ok">未发生</td><td>-Xmx2g 下稳定</td></tr>
+    <tr><td>一致性校验</td><td class="ok">行数一致</td><td>源 1,570,520 = 目标 1,570,520，抽样 54 表无重复主键</td></tr>
+  </tbody>
+</table>
+
+<div class="note"><b>解读：</b>全量速率在 95s 之后进入平稳平台（~3.4k 行/s），说明瓶颈在源端快照读取 + 目标端批量写入的 I/O，而非 CPU/内存；
+尾段（473s 后）速率回落是因为 585 张无 <code>update_time</code> 的表走全量兜底、且风暴阶段源端产生少量删除，属正常收敛。
+<b>结论：百万级表（3000+ 表）可在 8–9 分钟内完成首轮全量基准同步。</b></div>
+
+<!-- ============ 2. 实时同步时效性 ============ -->
+<h2>二、实时同步时效性（端到端延迟）</h2>
+<p>实时同步指全量完成后进入 binlog 增量模式，源库的单条 DML/DDL 提交后，目标库多久可见。
+以下为 geo_source.t_order 上的基准（每项独立测量，源提交→目标可见的墙钟时间，单位秒）：</p>
+
+<table>
+  <thead><tr><th>操作类型</th><th>样本</th><th>min</th><th>p50</th><th>p95</th><th>p99</th><th>max</th><th>avg</th></tr></thead>
+  <tbody>
+    <tr><td>INSERT</td><td class="num">60</td><td class="num">2.16</td><td class="num">2.42</td><td class="num">2.67</td><td class="num">3.70</td><td class="num">3.70</td><td class="num">2.46</td></tr>
+    <tr><td>UPDATE</td><td class="num">30</td><td class="num">0.83</td><td class="num">2.93</td><td class="num">2.99</td><td class="num">3.07</td><td class="num">3.07</td><td class="num">2.87</td></tr>
+    <tr><td>DELETE</td><td class="num">30</td><td class="num">1.36</td><td class="num">2.91</td><td class="num">3.09</td><td class="num">3.13</td><td class="num">3.13</td><td class="num">2.88</td></tr>
+    <tr><td>DDL(ADD COLUMN)</td><td class="num">3</td><td class="num">0.30</td><td class="num">0.31</td><td class="num">0.58</td><td class="num">0.58</td><td class="num">0.58</td><td class="num">0.40</td></tr>
+  </tbody>
+</table>
+
+<div class="chartbox">
+  <div style="font-weight:600;margin-bottom:8px">实时同步延迟分位数（DML：p50 / p95 / p99，单位秒）</div>
+  <svg viewBox="0 0 640 300" width="100%" preserveAspectRatio="xMidYMid meet" role="img" aria-label="延迟分位数柱状图">
+    <!-- axes -->
+    <g stroke="#273140" stroke-width="1">
+      <line x1="50" y1="20" x2="50" y2="250"/><line x1="50" y1="250" x2="610" y2="250"/>
+      <line x1="50" y1="200" x2="610" y2="200"/><line x1="50" y1="150" x2="610" y2="150"/>
+      <line x1="50" y1="100" x2="610" y2="100"/><line x1="50" y1="50" x2="610" y2="50"/>
+    </g>
+    <g fill="#9aa7b4" font-size="11">
+      <text x="30" y="254">0s</text><text x="24" y="204">1s</text><text x="24" y="154">2s</text>
+      <text x="24" y="104">3s</text><text x="24" y="54">4s</text>
+    </g>
+    <!-- INSERT group x=80 -->
+    <g>
+      <rect x="80" y="129" width="38" height="121" fill="#E50914"/>
+      <rect x="124" y="116" width="38" height="134" fill="#f59e0b"/>
+      <rect x="168" y="65" width="38" height="185" fill="#3b82f6"/>
+      <text x="99" y="266" fill="#cdd9e5" font-size="11" text-anchor="middle">INSERT</text>
+      <text x="99" y="122" fill="#fff" font-size="10" text-anchor="middle">2.4</text>
+      <text x="143" y="109" fill="#fff" font-size="10" text-anchor="middle">2.7</text>
+      <text x="187" y="58" fill="#fff" font-size="10" text-anchor="middle">3.7</text>
+    </g>
+    <!-- UPDATE group x=270 -->
+    <g>
+      <rect x="270" y="104" width="38" height="146" fill="#E50914"/>
+      <rect x="314" y="101" width="38" height="149" fill="#f59e0b"/>
+      <rect x="358" y="97" width="38" height="153" fill="#3b82f6"/>
+      <text x="289" y="266" fill="#cdd9e5" font-size="11" text-anchor="middle">UPDATE</text>
+      <text x="289" y="97" fill="#fff" font-size="10" text-anchor="middle">2.9</text>
+      <text x="333" y="94" fill="#fff" font-size="10" text-anchor="middle">3.0</text>
+      <text x="377" y="90" fill="#fff" font-size="10" text-anchor="middle">3.1</text>
+    </g>
+    <!-- DELETE group x=460 -->
+    <g>
+      <rect x="460" y="105" width="38" height="145" fill="#E50914"/>
+      <rect x="504" y="96" width="38" height="154" fill="#f59e0b"/>
+      <rect x="548" y="93" width="38" height="157" fill="#3b82f6"/>
+      <text x="479" y="266" fill="#cdd9e5" font-size="11" text-anchor="middle">DELETE</text>
+      <text x="479" y="98" fill="#fff" font-size="10" text-anchor="middle">2.9</text>
+      <text x="523" y="89" fill="#fff" font-size="10" text-anchor="middle">3.1</text>
+      <text x="567" y="86" fill="#fff" font-size="10" text-anchor="middle">3.1</text>
+    </g>
+  </svg>
+  <div class="legend">
+    <span><i style="background:#E50914"></i>p50</span>
+    <span><i style="background:#f59e0b"></i>p95</span>
+    <span><i style="background:#3b82f6"></i>p99</span>
+  </div>
+</div>
+
+<table>
+  <thead><tr><th>批量场景</th><th>指标</th><th>实测</th></tr></thead>
+  <tbody>
+    <tr><td rowspan="3">单事务逐条提交 100 行</td><td>末行可见延迟</td><td class="num">1.86 s</td></tr>
+    <tr><td>稳态吞吐</td><td class="num">53.9 行/s</td></tr>
+    <tr><td>到达率</td><td class="ok">100 / 100（全部一致到达）</td></tr>
+  </tbody>
+</table>
+
+<div class="note"><b>解读：</b>三种 DML 的 p50 均落在 <b>2.4–2.9s</b>，p99 均在 <b>3.7s 以内</b>，与 3s 的 checkpoint 间隔高度吻合（机理见第四节）；
+DDL 结构变更亚秒级传播（0.3s）。批量 100 行在提交后约 1.9s 内全部可见，稳态吞吐 ~54 行/s（受单表 keyBy 串行落库约束，多表/多库可线性扩展）。
+<b>结论：实时同步端到端延迟稳定 &lt; 4s，满足秒级灾备 RPO 诉求。</b></div>
+
+<!-- ============ 3. 增量风暴 ============ -->
+<h2>三、增量风暴（高负载持续写入）</h2>
+<p>模拟业务高峰期持续写入：在 180s 内不断向源端注入 INSERT/UPDATE/DELETE，观察服务存活与最终收敛。</p>
+<table>
+  <thead><tr><th>指标</th><th>实测</th></tr></thead>
+  <tbody>
+    <tr><td>风暴时长</td><td class="num">180 s</td></tr>
+    <tr><td>注入量</td><td class="num">INSERT 4700 / UPDATE 235 / DELETE 235（合计 5170 次）</td></tr>
+    <tr><td>平均写入速率</td><td class="num">约 28.7 ops/s（受测试生成器单线程限制，非引擎上限）</td></tr>
+    <tr><td>服务进程</td><td class="ok">存活，无崩溃</td></tr>
+    <tr><td>OOM</td><td class="ok">未发生（峰值堆 351 / 2048 MB）</td></tr>
+    <tr><td>最终一致性</td><td class="ok">源 1,577,208 = 目标 1,577,208，54 表抽样无重复主键</td></tr>
+  </tbody>
+</table>
+<div class="note"><b>解读：</b>在持续写入下引擎保持 EXACTLY_ONCE 语义并最终精确收敛；风暴期间未出现堆积、丢数据或内存溢出。
+（注：28.7 ops/s 是测试客户端的注入上限，并非同步引擎吞量上限；单表 keyBy 串行落库下，更高压的源端写入会被 checkpoint 批量缓冲，按 3s 节奏有序落库。）</div>
+
+<!-- ============ 4. 时效机理 ============ -->
+<h2>四、为什么实时延迟稳定在 ~3s（机理说明）</h2>
+<p>GeoDRSync 采用 Flink CDC 的 <b>快照 + 增量</b> 两阶段管道，实时延迟的下界由 checkpoint 机制决定：</p>
+<ul>
+  <li><b>Checkpoint 屏障对齐（EXACTLY_ONCE）：</b>作业每 3s 触发一次 checkpoint；sink 在收到 barrier 前先同步 flush 已缓冲的变更，<b>位点不越过任何未落库的数据</b>。因此单条变更的「可见时刻」= 它被纳入的下一个 checkpoint 完成时刻，典型延迟即落在 0–3s 区间。</li>
+  <li><b>同表保序（keyBy）：</b>按 <code>库.表</code> 分区，同表变更严格有序，避免乱序导致的临时不一致。</li>
+  <li><b>DDL 与行同键、先 flush 再改结构：</b>DDL 事件与同表的行变更走同一 key，sink 先 flush 已有行、再应用结构变更，杜绝「结构未变就写新列」的报错。</li>
+  <li><b>落库幂等：</b>写入用 <code>INSERT … ON DUPLICATE KEY UPDATE</code>，删除用 NULL-safe 比对；即使 checkpoint 重放也不会产生重复或丢失。</li>
+  <li><b>批量聚合：</b>一个 checkpoint 周期内到达的多条变更会被聚合后批量写入，故「突发写入」与「单条写入」延迟接近，p99 不明显抬升。</li>
+</ul>
+
+<h3>缩短延迟的可调旋钮</h3>
+<table>
+  <thead><tr><th>参数</th><th>当前值</th><th>调整效果</th></tr></thead>
+  <tbody>
+    <tr><td><code>execution.checkpointing.interval</code></td><td class="num">3 s</td><td>调小（如 1s）可把 p99 压到 ~1.5s，但 checkpoint 开销与 IOPS 压力上升</td></tr>
+    <tr><td>并行度 / 连接池</td><td class="num">MiniCluster 默认</td><td>多库多表场景提高并行度可提升全量速率与批量吞吐</td></tr>
+    <tr><td>目标端批量大小</td><td class="num">默认</td><td>增大 batch 可降低单条落库开销，提升高并发写入吞吐</td></tr>
+  </tbody>
+</table>
+
+<!-- ============ 5. 结论 ============ -->
+<h2>五、结论与 SLA 评估</h2>
+<table>
+  <thead><tr><th>能力</th><th>实测</th><th>结论</th></tr></thead>
+  <tbody>
+    <tr><td>全量同步速度</td><td class="num">3015 表 / 157 万行 / 509s（~3k 行/s）</td><td class="ok">百万级首轮基准 8–9 分钟</td></tr>
+    <tr><td>实时同步延迟</td><td class="num">p50 2.4–2.9s，p99 ≤ 3.7s</td><td class="ok">满足秒级 RPO</td></tr>
+    <tr><td>DDL 时效</td><td class="num">ADD COLUMN p50 0.31s</td><td class="ok">亚秒级结构传播</td></tr>
+    <tr><td>高负载稳定性</td><td class="ok">180s 风暴存活、无 OOM、精确收敛</td><td class="ok">生产可用</td></tr>
+  </tbody>
+</table>
+<p style="margin-top:18px">本报告的原始数据分别来自 <code>tests/perf-report.txt</code>、<code>tests/perf-storm-report.txt</code> 与本次新增的
+<code>tests/verify_perf_latency.py</code>（产物 <code>target/perf-latency.json</code>），均可在本机 Docker 环境复跑。</p>
+
+<footer>
+  GeoDRSync 性能测试报告 · 数据基准日 2026-10-17 / 2026-10-18 · 引擎 Flink CDC 3.7 + Flink 2.2 MiniCluster · JVM -Xmx2g ·
+  源 127.0.0.1:13306 → 目标 127.0.0.1:13307（Docker）
+</footer>
+
+</div>
+</body>
+</html>

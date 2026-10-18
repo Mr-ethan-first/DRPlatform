@@ -47,6 +47,8 @@ public class FlinkCdcJobManager {
 
     /** 因「目标端缺表」触发全量重扫的次数（instanceKey -> 次数），防止重启风暴 */
     private final Map<String, Integer> missingTries = new ConcurrentHashMap<>();
+    /** 源端疑似删除的表（db.table）：连续两个巡检周期都缺失才执行目标端 DROP，防瞬时误报 */
+    private final Map<String, java.util.Set<String>> pendingRemoved = new ConcurrentHashMap<>();
 
     public FlinkCdcJobManager(DRPlatformProperties properties, JdbcTemplate jdbcTemplate) {
         this.properties = properties;
@@ -61,6 +63,21 @@ public class FlinkCdcJobManager {
     }
 
     // ===================== 巡检：动态新增库/表 + 失败自愈 =====================
+
+    /** 拉起「映射存在但作业从未注册」的主机对（启动失败兜底），复用巡检冷却防风暴 */
+    private void tryStartMissingJob(DatabaseMapping m, String key) {
+        long cooldown = Math.max(0, properties.getCdc().getDiscoveryRestartCooldownSec()) * 1000L;
+        if (cooldown > 0 && System.currentTimeMillis() - lastRestartMs < cooldown) {
+            return;
+        }
+        lastRestartMs = System.currentTimeMillis();
+        log.info("CDC watchdog found missing job for {} (previous start failed), trying startOrResume", key);
+        try {
+            startOrResume(m);
+        } catch (Exception e) {
+            log.warn("CDC watchdog startOrResume failed for {}: {}", key, e.getMessage());
+        }
+    }
 
     private void startWatchdog() {
         int interval = Math.max(0, properties.getCdc().getDiscoveryIntervalSec());
@@ -87,12 +104,22 @@ public class FlinkCdcJobManager {
                 String key = m.getInstanceKey();
                 FlinkCdcSyncJob job = jobs.get(key);
                 if (job == null) {
+                    // 0) 启动失败兜底：作业从未成功注册（如目标库故障期间应用启动、
+                    //    executeAsync 前后即抛错）时 jobs 里没有它，若不在此拉起，
+                    //    该映射将永久停同步（数据丢失 0 容忍不允许）。带冷却防风暴。
+                    tryStartMissingJob(m, key);
                     continue;
                 }
                 // 1) 失败自愈：Flink 固定次数重启策略耗尽后作业会停在 FAILED，需本层拉起
                 String state = safeStatus(job);
                 if ("FAILED".equals(state) || "CANCELED".equals(state) || "FINISHED".equals(state)) {
-                    restartJob(m, key, "job state=" + state, false);
+                    // 终态失败一律「全新 INITIAL 重扫」而非从损坏的 checkpoint/savepoint 恢复：
+                    // flink-cdc 在 binlog 流式阶段处理「删表/DROP DATABASE」这类移除已捕获表的 DDL 时，
+                    // 其 MySqlSourceReader.fillMetadataForBinlogSplit 会因 split 元数据数组与表清单不一致
+                    // 抛 IllegalArgumentException (fromIndex>toIndex) 而崩溃；从含该损坏 split 的
+                    // checkpoint 恢复会反复崩溃直至彻底停同步。INITIAL 从「当前」库表快照重建 split，
+                    // 起始 binlog 位点已越过触发崩溃的那条 DROP，从而彻底绕过该损坏状态。
+                    restartJob(m, key, "job state=" + state, true);
                     continue;
                 }
                 // 2) 动态新增库/表：flink-cdc 运行期不探测，需本层巡检发现后重启纳入
@@ -110,11 +137,49 @@ public class FlinkCdcJobManager {
                 if (!added.isEmpty()) {
                     // 基线只在真正重启成功后才更新：否则冷却期被跳过的发现会永远丢失
                     missingTries.remove(key);
-                    restartJob(m, key, "newly added tables: " + added, false, current);
+                    // 新表触发 forceInitial 重扫前，先冲刷「已确认缺失」的删除对账：
+                    // 重扫只重建源端现存的表，若不清理，目标端将永久残留源端已删除的库/表
+                    java.util.Set<String> pending = pendingRemoved.remove(key);
+                    if (pending != null && !pending.isEmpty()) {
+                        dropRemovedOnTarget(m, key, pending, prev);
+                    }
+                    // forceInitial=true：必须全量重扫，不能用 savepoint 恢复！
+                    // flink-cdc 3.7 从 savepoint 恢复的 binlog split 只带旧表 schema，
+                    // 且 reader 对二次赋 split 会跳过新表 schema 发现（discoverTableSchemasForBinlogSplit
+                    // 的 SKIP 分支）→ 新表快照数据能到，但其后所有 binlog 事件（UPDATE/DELETE/DROP）
+                    // 因缺 schema 被静默丢弃（作业无任何报错，实测 TGT 残留已删除的库）。
+                    // INITIAL 重扫 = 新表连同全库快照 + 幂等 upsert，不重不丢。
+                    restartJob(m, key, "newly added tables: " + added, true, current);
                     continue;
                 }
-                if (!prev.equals(current)) {
-                    capturedTables.put(key, current);
+                java.util.Set<String> removed = new java.util.HashSet<>(prev);
+                removed.removeAll(current);
+                if (removed.isEmpty()) {
+                    pendingRemoved.remove(key);
+                    if (!prev.equals(current)) {
+                        capturedTables.put(key, current);
+                    }
+                } else {
+                    // 2.5) 源端已删除的库/表 → 双周期确认后在目标端同步删除。
+                    // flink-cdc 3.7 不把 DROP DATABASE/TABLE 作为 schema-change 事件向下转发
+                    // （Debezium 收到即吞，实测日志：Received MySQL DDL event ... ddl=DROP DATABASE），
+                    // 目标端会永久残留已删除的数据 → 与源端发散，0 容忍语义下必须对账删除。
+                    // 安全护栏：① 只删本映射此前纳管（基线）且源端连续两个周期消失的表；
+                    // ② 确认前不收缩基线（否则下一周期 removed 恒为空，确认永远不成立）；
+                    // ③ 尊重 ignore 过滤；④ 整库删除时连空壳库一起清；⑤ 绝不触碰无关库表。
+                    java.util.Set<String> lastSeen = pendingRemoved.get(key);
+                    if (lastSeen == null) {
+                        pendingRemoved.put(key, removed);
+                    } else {
+                        java.util.Set<String> confirmed = new java.util.HashSet<>(lastSeen);
+                        confirmed.retainAll(removed);
+                        if (!confirmed.isEmpty()) {
+                            dropRemovedOnTarget(m, key, confirmed, prev);
+                        }
+                        pendingRemoved.put(key, new java.util.HashSet<>(removed));
+                        capturedTables.put(key, current);
+                    }
+                    continue;
                 }
                 // 3) 源端有、目标端没有：
                 //    - 空表：CDC 快照不会产生行事件，目标端永远不会建表 → 直接复制建表语句补齐；
@@ -176,7 +241,7 @@ public class FlinkCdcJobManager {
                                                  DatabaseMapping filterMapping) {
         String url = String.format(
                 "jdbc:mysql://%s:%d/information_schema?useUnicode=true&characterEncoding=utf8"
-                        + "&serverTimezone=UTC&allowPublicKeyRetrieval=true&useSSL=false&connectTimeout=5000",
+                        + "&serverTimezone=UTC&allowPublicKeyRetrieval=true&useSSL=false&connectTimeout=5000&socketTimeout=60000",
                 host, port);
         java.util.Set<String> out = new java.util.HashSet<>();
         try (java.sql.Connection c = java.sql.DriverManager.getConnection(url, user, password);
@@ -209,7 +274,7 @@ public class FlinkCdcJobManager {
     private java.util.Set<String> nonEmptySourceTables(DatabaseMapping mapping) {
         String url = String.format(
                 "jdbc:mysql://%s:%d/information_schema?useUnicode=true&characterEncoding=utf8"
-                        + "&serverTimezone=UTC&allowPublicKeyRetrieval=true&useSSL=false&connectTimeout=5000",
+                        + "&serverTimezone=UTC&allowPublicKeyRetrieval=true&useSSL=false&connectTimeout=5000&socketTimeout=60000",
                 mapping.getSourceHost(), mapping.getSourcePort());
         java.util.Set<String> out = new java.util.HashSet<>();
         try (java.sql.Connection c = java.sql.DriverManager.getConnection(
@@ -238,11 +303,11 @@ public class FlinkCdcJobManager {
     private void tryCreateEmptyTable(DatabaseMapping mapping, String db, String table) {
         String srcUrl = String.format(
                 "jdbc:mysql://%s:%d/%s?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC"
-                        + "&allowPublicKeyRetrieval=true&useSSL=false&connectTimeout=5000",
+                        + "&allowPublicKeyRetrieval=true&useSSL=false&connectTimeout=5000&socketTimeout=60000",
                 mapping.getSourceHost(), mapping.getSourcePort(), db);
         String tgtUrl = String.format(
                 "jdbc:mysql://%s:%d?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC"
-                        + "&allowPublicKeyRetrieval=true&useSSL=false&connectTimeout=5000",
+                        + "&allowPublicKeyRetrieval=true&useSSL=false&connectTimeout=5000&socketTimeout=60000",
                 mapping.getTargetHost(), mapping.getTargetPort());
         String ddl = null;
         try (java.sql.Connection c = java.sql.DriverManager.getConnection(
@@ -273,6 +338,63 @@ public class FlinkCdcJobManager {
             log.info("CDC created missing empty table on target: {}.{}", db, table);
         } catch (Exception e) {
             log.warn("Create missing table {}.{} on target failed: {}", db, table, e.getMessage());
+        }
+    }
+
+    /**
+     * 把源端已删除（且双周期确认）的库/表从目标端同步删除。
+     * <p>只处理本映射此前纳管过的 {@code db.table}（来自基线 prev），绝不触碰
+     * 目标端上与本映射无关的库/表；遵守 ignore 过滤规则；整库删除时连空壳库一起清。
+     */
+    private void dropRemovedOnTarget(DatabaseMapping m, String key,
+                                     java.util.Set<String> confirmedRemoved,
+                                     java.util.Set<String> prevBaseline) {
+        String url = String.format(
+                "jdbc:mysql://%s:%d?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC"
+                        + "&allowPublicKeyRetrieval=true&useSSL=false&connectTimeout=5000&socketTimeout=60000",
+                m.getTargetHost(), m.getTargetPort());
+        // 按库聚合，判断「整库删除」：该库在基线里的表全部被删
+        java.util.Map<String, java.util.Set<String>> byDb = new java.util.LinkedHashMap<>();
+        for (String t : prevBaseline) {
+            int dot = t.indexOf('.');
+            if (dot > 0) {
+                byDb.computeIfAbsent(t.substring(0, dot), k -> new java.util.HashSet<>()).add(t.substring(dot + 1));
+            }
+        }
+        java.util.Set<String> handledDbs = new java.util.HashSet<>();
+        try (java.sql.Connection c = java.sql.DriverManager.getConnection(
+                url, m.getTargetUser(), m.getTargetPassword());
+             java.sql.Statement st = c.createStatement()) {
+            CdcFilter filter = new CdcFilter(m);
+            for (String t : confirmedRemoved) {
+                int dot = t.indexOf('.');
+                if (dot <= 0) {
+                    continue;
+                }
+                String db = t.substring(0, dot), table = t.substring(dot + 1);
+                if (!filter.acceptDatabase(db) || !filter.acceptTable(db, table)) {
+                    continue;
+                }
+                st.execute("DROP TABLE IF EXISTS `" + db + "`.`" + table + "`");
+                log.info("CDC dropped removed table on target: {}.{} (source no longer has it)", db, table);
+                handledDbs.add(db);
+            }
+            // 整库删除：基线里该库的表全部确认删除，且源端确无此库 → 删目标空壳库
+            for (java.util.Map.Entry<String, java.util.Set<String>> e : byDb.entrySet()) {
+                String db = e.getKey();
+                if (!handledDbs.contains(db) || !e.getValue().stream().allMatch(
+                        tb -> confirmedRemoved.contains(db + "." + tb))) {
+                    continue;
+                }
+                if (!filter.acceptDatabase(db)) {
+                    continue;
+                }
+                st.execute("DROP DATABASE IF EXISTS `" + db + "`");
+                log.info("CDC dropped removed database on target: {} (source no longer has it)", db);
+            }
+            pendingRemoved.remove(key);
+        } catch (Exception e) {
+            log.warn("Drop removed tables on target failed for {}: {}", key, e.getMessage());
         }
     }
 
@@ -308,8 +430,43 @@ public class FlinkCdcJobManager {
 
     private synchronized void restartJob(DatabaseMapping mapping, String key, String reason,
                                          boolean forceInitial, java.util.Set<String> newBaseline) {
+        restartJob(mapping, key, reason, forceInitial, newBaseline, true);
+    }
+
+    /**
+     * 配置热应用：对全部运行中作业做「savepoint 优雅停止 → 从 savepoint 恢复」，
+     * 让新运行时参数（并行度/内存/池大小等）无损生效。显式绕过巡检冷却 ——
+     * 这是用户主动操作，且 savepoint 前强制 flush、恢复不丢不重。
+     *
+     * @return instanceKey -> 结果（restarted / skipped(原因) / ERROR: 信息）
+     */
+    public synchronized Map<String, String> applyRuntimeConfig() {
+        Map<String, String> results = new java.util.LinkedHashMap<>();
+        List<DatabaseMapping> mappings = properties.getMappings();
+        if (mappings == null) {
+            return results;
+        }
+        for (DatabaseMapping m : mappings) {
+            String key = m.getInstanceKey();
+            if (!jobs.containsKey(key)) {
+                continue;
+            }
+            try {
+                restartJob(m, key, "runtime-config apply", false, null, false);
+                results.put(key, "restarted");
+            } catch (Exception e) {
+                log.error("Runtime-config apply failed for {}: {}", key, e.getMessage());
+                results.put(key, "ERROR: " + e.getMessage());
+            }
+        }
+        return results;
+    }
+
+    private synchronized void restartJob(DatabaseMapping mapping, String key, String reason,
+                                         boolean forceInitial, java.util.Set<String> newBaseline,
+                                         boolean respectCooldown) {
         long cooldown = Math.max(0, properties.getCdc().getDiscoveryRestartCooldownSec()) * 1000L;
-        if (cooldown > 0 && System.currentTimeMillis() - lastRestartMs < cooldown) {
+        if (respectCooldown && cooldown > 0 && System.currentTimeMillis() - lastRestartMs < cooldown) {
             log.info("CDC restart skipped for {} (cooldown), reason={}", key, reason);
             return;
         }
@@ -321,14 +478,30 @@ public class FlinkCdcJobManager {
         log.info("CDC job restart triggered for {}: {}", key, reason);
         FlinkCdcSyncJob old = jobs.remove(key);
         if (old != null) {
+            boolean stopClean = false;
             try {
                 String sp = old.stopWithSavepoint();
                 // 必须把 savepoint 路径写回元库：否则重启只能回退到可能已被清理的 retained checkpoint
                 if (sp != null) {
                     persistState(key, null, sp, "STOPPED", null);
+                    stopClean = true;
                 }
             } catch (Exception e) {
                 log.warn("Stop-with-savepoint failed during restart for {}: {}", key, e.getMessage());
+            }
+            if (!stopClean) {
+                // savepoint 未成功 = 旧作业状态不可信（可能正处在崩溃循环中，其 checkpoint
+                // 含不一致的 binlog split 元数据）。从坏 checkpoint 恢复的作业「不崩溃但
+                // 静默丢数据事件」（实测 flink-cdc fillMetadataForBinlogSplit 越界 bug 的
+                // 衍生形态），比崩溃更危险 → 强制全新 INITIAL 重扫（幂等 upsert 保证不重不丢）。
+                forceInitial = true;
+            }
+            // 宽限等待：savepoint future 完成后 debezium binlog 连接的释放仍有数秒滞后，
+            // 立即启动新作业会与残留连接抢 server-id/复制位点，触发崩溃-重启循环
+            try {
+                Thread.sleep(3000);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
             }
         }
         try {

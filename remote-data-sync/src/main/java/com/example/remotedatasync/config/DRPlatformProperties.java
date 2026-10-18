@@ -104,10 +104,25 @@ public class DRPlatformProperties {
         private long checkpointIntervalMs = 3000;
         /** savepoint 根目录（每主机对一个子目录） */
         private String savepointPath = "savepoints";
-        /** Flink 作业并行度（binlog 读取段并行度） */
-        private int parallelism = 2;
+        /**
+         * Flink 作业并行度（binlog 读取段并行度）。
+         * <b>0 = 自动适配</b>：按 CPU 内核数取值（下限 1、上限 64），
+         * 服务器核越多同步越快；&gt;0 则为显式配置，优先生效。
+         */
+        private int parallelism = 0;
         /** 内嵌 TaskManager 进程内存（MiniCluster 与 JM 同 JVM，需留足 JVM 堆） */
         private String taskmanagerMemory = "1024m";
+
+        /**
+         * 解析实际生效的并行度：显式配置（&gt;0）优先；未配置（&lt;=0）按 CPU 内核自动适配，
+         * 夹在 [1, 64] 内防极端机器（如 128 核超线程）把内嵌 MiniCluster 撑爆。
+         */
+        public int resolveParallelism() {
+            if (parallelism > 0) {
+                return Math.min(parallelism, 64);
+            }
+            return Math.min(64, Math.max(1, Runtime.getRuntime().availableProcessors()));
+        }
         /** 快照分片大小（行）：影响快照阶段并行切片粒度 */
         private int snapshotChunkSize = 8096;
         /** 快照读取 fetch size */

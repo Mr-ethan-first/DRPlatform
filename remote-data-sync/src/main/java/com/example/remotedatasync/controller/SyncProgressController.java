@@ -184,6 +184,13 @@ public class SyncProgressController {
     @PostMapping("/mapping/add")
     public Result<MappingBatchResult> addMapping(@RequestBody @Valid SyncMappingRequestDTO dto) {
         try {
+            // 自同步防护：源与目标不可为同一数据库实例，否则 CDC 会把源端 binlog 又写回源端，
+            // 产生无限复制环（不同业务行互相覆盖 + 数据无限放大），是致命一致性缺陷。
+            if (dto.getSourceHost().equals(dto.getTargetHost())
+                    && dto.getSourcePort() == dto.getTargetPort()) {
+                throw new BusinessException(DRPlatformErrorCodeEnum.PARAM_ERROR.getCode(),
+                        "源与目标不能为同一数据库实例（禁止自同步/复制环）");
+            }
             // 目标库连通性预检：不可达时直接拒绝，避免创建无效映射
             DatabaseConfig targetCfg = new DatabaseConfig(dto.getTargetHost(), dto.getTargetPort(),
                     dto.getTargetUser(), dto.getTargetPassword(), "");
@@ -191,6 +198,15 @@ public class SyncProgressController {
             if (!targetTest.isOk()) {
                 throw new BusinessException(DRPlatformErrorCodeEnum.DB_CONNECTION_TEST_FAILED.getCode(),
                         "目标库连接测试未通过: " + targetTest.getMessage());
+            }
+            // 源库连通性预检：源不可达时同样直接拒绝，避免创建出一个永远无法读取的"僵尸"映射
+            // （此前仅校验目标，导致错误源密码/端口的映射被创建、CDC 作业静默失败）。
+            DatabaseConfig sourceCfg = new DatabaseConfig(dto.getSourceHost(), dto.getSourcePort(),
+                    dto.getSourceUser(), dto.getSourcePassword(), "");
+            ConnectionTestResult sourceTest = sourceCfg.testServerConnection();
+            if (!sourceTest.isOk()) {
+                throw new BusinessException(DRPlatformErrorCodeEnum.DB_CONNECTION_TEST_FAILED.getCode(),
+                        "源库连接测试未通过: " + sourceTest.getMessage());
             }
             List<DatabaseMapping> mappings = dto.toMappings();
             if (mappings.isEmpty()) {

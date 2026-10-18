@@ -29,14 +29,14 @@ public class DatabaseConfig implements Serializable {
 
     public String getDBURL() {
         return String.format(
-                "jdbc:mysql://%s:%d/%s?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false&rewriteBatchedStatements=true",
+                "jdbc:mysql://%s:%d/%s?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false&rewriteBatchedStatements=true&connectTimeout=10000&socketTimeout=60000",
                 host, port, databaseName == null ? "" : databaseName);
     }
 
     /** 仅含主机端口的库无关 URL，用于连接 information_schema 等系统库 */
     public String getServerURL() {
         return String.format(
-                "jdbc:mysql://%s:%d/?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false",
+                "jdbc:mysql://%s:%d/?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false&connectTimeout=10000&socketTimeout=60000",
                 host, port);
     }
 

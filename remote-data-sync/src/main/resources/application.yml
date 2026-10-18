@@ -74,8 +74,8 @@ drplatform:
     checkpoint-interval-ms: 3000
     # savepoint 根目录（每主机对一个子目录；Linux 部署建议 /data/DRPlatform/savepoint）
     savepoint-path: savepoints
-    # 作业并行度（快照分片与 binlog 读取并行度）
-    parallelism: 2
+    # 作业并行度（快照分片与 binlog 读取并行度）：0 = 按 CPU 内核自动适配（下限1上限64）；>0 = 显式配置
+    parallelism: 0
     # 内嵌 TaskManager 内存（MiniCluster 与 JM 同 JVM，JVM 堆需 > 该值 + Spring 上下文）
     taskmanager-memory: 1024m
     # 快照分片大小（行）：大表切片并行度

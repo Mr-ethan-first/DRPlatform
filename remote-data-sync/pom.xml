@@ -20,6 +20,9 @@
         <maven.compiler.target>17</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <mybatis-plus.version>3.5.9</mybatis-plus.version>
+        <!-- Flink CDC（binlog 同步引擎）：flink-cdc 3.7.0-2.2 对应 Flink 2.2.x，支持 JDK21 运行 -->
+        <flink.version>2.2.0</flink.version>
+        <flink-cdc.version>3.7.0-2.2</flink-cdc.version>
     </properties>
 
     <dependencies>
@@ -69,6 +72,74 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
+
+        <!-- ===================== Flink CDC（binlog 全量+增量同步引擎） ===================== -->
+        <!-- MySQL CDC Source：内部基于 Debezium，快照(全量)+binlog(增量)，checkpoint 内含 binlog 位点 -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-connector-mysql-cdc</artifactId>
+            <version>${flink-cdc.version}</version>
+        </dependency>
+        <!-- 内嵌 MiniCluster（LocalEnvironment）运行所需 -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-clients</artifactId>
+            <version>${flink.version}</version>
+        </dependency>
+        <!-- flink-cdc 将 flink-connector-base 标记为 provided，运行/测试/生产 fat-jar 都必须显式包含，否则 NoClassDefFound RecordEmitter -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-connector-base</artifactId>
+            <version>${flink.version}</version>
+        </dependency>
+        <!-- flink-cdc 的 MySqlSourceConfig 引用 org.apache.flink.table.catalog.ObjectPath（来自 flink-table-common），
+             Flink 将其标记为 provided，本地内嵌运行必须显式包含 -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-table-common</artifactId>
+            <version>${flink.version}</version>
+        </dependency>
+        <!--
+          Flink 2.2 的 core/runtime/clients 引用 guava33 重定位（org.apache.flink.shaded.guava33.*），
+          本工程显式声明 33.4.0 保证 Flink 自身运行时不缺类。
+          注意：flink-cdc（自定义 3.7.0-2.2）内置的 debezium 代码引用的是 guava31 重定位
+          （org.apache.flink.shaded.guava31.*）。两者是同一 GA（org.apache.flink:flink-shaded-guava）
+          的不同版本，Maven 依赖仲裁只会保留一个，故把 guava31 以 system scope 再挂一份到 classpath，
+          使 guava31 与 guava33 两个 jar 在运行时并存（包名不同，无冲突）。
+        -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-shaded-guava</artifactId>
+            <version>33.4.0-jre-20.0</version>
+        </dependency>
+        <dependency>
+            <!--
+              guava31 桥接依赖：flink-cdc（自定义 3.7.0-2.2）的 debezium 代码引用
+              org.apache.flink.shaded.guava31.* 重定位，而 Flink 2.2 core 引用 guava33.*。
+              两者包名不同、都需要 —— 但它们本是同一 GA（org.apache.flink:flink-shaded-guava）
+              的两个版本，Maven 仲裁只能留一个。
+              解决：把 lib/flink-shaded-guava-31.1-jre-17.0.jar 以独立 GA 安装进本地仓库
+              （构建机一次性执行，Maven 依赖解析先于生命周期，无法用 install-file 绑定自动完成）：
+                mvn install:install-file \
+                  -Dfile=lib/flink-shaded-guava-31.1-jre-17.0.jar \
+                  -DgroupId=org.apache.flink.bridge \
+                  -DartifactId=flink-shaded-guava31 \
+                  -Dversion=31.1-jre-17.0 -Dpackaging=jar
+              之后以普通 compile 依赖引入 —— 与 guava33 并存，shade 正常打进 uber jar。
+            -->
+            <groupId>org.apache.flink.bridge</groupId>
+            <artifactId>flink-shaded-guava31</artifactId>
+            <version>31.1-jre-17.0</version>
+        </dependency>
+        <!-- Flink 内部走 log4j2 API，桥接到 Spring Boot 的 slf4j/logback，避免多绑定告警 -->
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-to-slf4j</artifactId>
+        </dependency>
     </dependencies>
 
     <build>
@@ -89,16 +160,63 @@
         </resources>
         <plugins>
             <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <configuration>
+                    <!-- Main-Class 写在原始 jar 的 manifest；shade 无 Manifest transformer 时会保留它 -->
+                    <archive>
+                        <manifest>
+                            <mainClass>com.example.remotedatasync.RemoteDataSyncApplication</mainClass>
+                        </manifest>
+                        <manifestEntries>
+                            <Multi-Release>true</Multi-Release>
+                        </manifestEntries>
+                    </archive>
+                </configuration>
+            </plugin>
+            <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
                 <configuration>
-                    <excludes>
-                        <exclude>
-                            <groupId>org.projectlombok</groupId>
-                            <artifactId>lombok</artifactId>
-                        </exclude>
-                    </excludes>
+                    <!-- 改用 maven-shade 生成 uber jar：
+                         Spring Boot 的 LaunchedURLClassLoader 与 Flink MiniCluster 的
+                         系统级反序列化（JobGraph 流节点）不兼容，会报
+                         ClassNotFoundException SimpleUdfStreamOperatorFactory；
+                         shade 后全部类平铺到系统 classpath，内嵌 MiniCluster 可正常运行 -->
+                    <skip>true</skip>
                 </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.1</version>
+                <configuration>
+                    <createDependencyReducedPom>false</createDependencyReducedPom>
+                    <filters>
+                        <filter>
+                            <artifact>*:*</artifact>
+                            <excludes>
+                                <exclude>META-INF/*.SF</exclude>
+                                <exclude>META-INF/*.DSA</exclude>
+                                <exclude>META-INF/*.RSA</exclude>
+                                <exclude>module-info.class</exclude>
+                            </excludes>
+                        </filter>
+                    </filters>
+                    <transformers>
+                        <!-- 合并 META-INF/services（SPI：JDBC 驱动、logback、Flink 等）；
+                             Main-Class 由 maven-jar-plugin 写入原始 manifest，shade 会保留 -->
+                        <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                    </transformers>
+                </configuration>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>

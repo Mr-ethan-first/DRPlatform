@@ -16,6 +16,9 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * 数据库级 Sink（每个映射一个）：管理该库下所有表的写入，并处理 DDL 事件。
  * 本地可运行版本中等价于 Flink 的 KeyedSinkProcessFunction。
+ * <p>
+ * 持有库名与 {@link WatermarkAck} 回调，在创建表级 Sink 时透传，使表级 Sink 落库成功后可回灌水位。
+ * </p>
  *
  * @author 50707
  */
@@ -31,6 +34,8 @@ public class DataBaseSinkFunction {
     private final int batchSize;
     private final int maxWalRetries;
     private final String instanceKey;
+    private final String dbName;
+    private final WatermarkAck ack;
     /** 忽略同步的表（DML/DDL 均跳过） */
     private final Set<String> ignoreTables;
 
@@ -47,6 +52,7 @@ public class DataBaseSinkFunction {
                                 TableLevelQueueManager queueManager,
                                 DatabaseMetadataService metadataService,
                                 int batchSize, int maxWalRetries, String instanceKey,
+                                String dbName, WatermarkAck ack,
                                 Set<String> ignoreTables) {
         this.sourceDB = sourceDB;
         this.targetDB = targetDB;
@@ -57,6 +63,8 @@ public class DataBaseSinkFunction {
         this.batchSize = batchSize;
         this.maxWalRetries = maxWalRetries;
         this.instanceKey = instanceKey;
+        this.dbName = dbName;
+        this.ack = ack;
         this.ignoreTables = ignoreTables == null ? java.util.Collections.emptySet() : ignoreTables;
     }
 
@@ -81,7 +89,8 @@ public class DataBaseSinkFunction {
         }
         String queueKey = instanceKey + "." + tableName;
         TableSinkFunction newSink = new TableSinkFunction(targetDB, info, connMgr, executorManager,
-                queueManager.getOrCreateTableQueue(queueKey, 20000), batchSize, maxWalRetries);
+                queueManager.getOrCreateTableQueue(queueKey, 20000), batchSize, maxWalRetries,
+                dbName, ack);
         newSink.start();
         tableFunctionMap.put(tableName, newSink);
         tableInfoMap.put(tableName, info);
@@ -102,6 +111,29 @@ public class DataBaseSinkFunction {
             return;
         }
         sink.enqueue(change);
+    }
+
+    /**
+     * 驱逐该表的 Sink（<b>不删除目标表</b>）。
+     * <p>
+     * 用途：DDL 结构变更后调用。目标表已由调用方按源端新结构重建，但 Sink 内部缓存的
+     * {@link TableInfo} 仍是变更前的旧列集合，若不驱逐，
+     * {@link TableSinkFunction#executeUpsert} 会用旧列名过滤，把 DDL 新增列的数据静默丢弃。
+     * 驱逐后下一次 {@link #ensureTable} 会按最新结构重建 Sink。
+     * </p>
+     */
+    public void evictTableSink(String tableName) {
+        TableSinkFunction sink = tableFunctionMap.remove(tableName);
+        if (sink != null) {
+            try {
+                sink.close();
+            } catch (Exception e) {
+                log.warn("Failed to close stale sink for table {}", tableName, e);
+            }
+        }
+        tableInfoMap.remove(tableName);
+        queueManager.removeTableQueue(instanceKey + "." + tableName);
+        log.info("Evicted stale sink for table {} (structure changed), will rebuild on next ensureTable", tableName);
     }
 
     /** DDL: 新增表 */

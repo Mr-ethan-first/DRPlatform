@@ -27,12 +27,23 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * DRPlatform 全链路自动化测试（主机对模型 / 纯忽略模式）：
+ * DRPlatform 全链路自动化测试（主机对模型 / 纯忽略模式）。
  * <p>
- * 本环境 192.168.88.88:3306 真实可达，测试用默认主机对 127.0.0.1 -> 192.168.88.88 做
- * "跨主机灾备"验证：源主机 127.0.0.1 下所有用户库会以<b>同名库</b>镜像方式实时同步到灾备主机
- * 192.168.88.88（新增库 / 新增表 / 增量 / 删除对账均在下一轮自动纳入，无需逐项配置）。
- * 覆盖 6 个 REST 接口 + 数据一致性 + 映射 CRUD。
+ * <b>环境</b>：早期版本依赖远程机 192.168.88.88:3306，该主机已离线导致用例无法复现。
+ * 现统一改用本机 Docker 容器（root/123456），三实例同在 127.0.0.1、按端口区分：
+ * <ul>
+ *   <li>{@code 127.0.0.1:13306} 生产中心主库（drp-src-mysql，binlog ROW）</li>
+ *   <li>{@code 127.0.0.1:13308} 生产中心备库（drp-src-standby-mysql，主备切换演练用）</li>
+ *   <li>{@code 127.0.0.1:13307} 灾备中心（drp-tgt-mysql）</li>
+ * </ul>
+ * 源主机下所有用户库会以<b>同名库</b>镜像方式实时同步到灾备主机（新增库 / 新增表 /
+ * 增量 / 删除对账均为 binlog 驱动）。覆盖 6 个 REST 接口 + 数据一致性 + 映射 CRUD。
+ * </p>
+ * <p>
+ * <b>运行前提</b>：① 三个容器已启动；② 本机 8899 端口上的常驻应用已停止
+ * （MySQL 的 max_user_connections 有限，应用连接池与测试上下文叠加会触发
+ * {@code User root already has more than 'max_user_connections' active connections}）。
+ * </p>
  *
  * @author 50707
  */
@@ -40,12 +51,18 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @ActiveProfiles("test")
 class DRPlatformConsistencyTest {
 
-    /** 生产中心（源主机） */
-    private static final String SRC_HOST = "127.0.0.1";
-    /** 灾备中心（目标主机，本环境真实可达） */
-    private static final String TGT_HOST = "192.168.88.88";
+    /** 生产中心（源主机）与灾备中心（目标主机）——同一 Docker 宿主，按端口区分 */
+    private static final String HOST = "127.0.0.1";
+    private static final int SRC_PORT = 13306;
+    private static final int TGT_PORT = 13307;
+    /** 生产中心备库：仅用于「新增映射」用例（见 testMappingConfigEndpoints 注释） */
+    private static final int STANDBY_PORT = 13308;
+
     private static final String USER = "root";
     private static final String PASS = "123456";
+
+    /** 默认主机对 key（instanceKey 含端口，见 DatabaseMapping#getInstanceKey） */
+    private static final String DEFAULT_KEY = HOST + ":" + SRC_PORT + "->" + HOST + ":" + TGT_PORT;
 
     @LocalServerPort
     private int port;
@@ -134,45 +151,45 @@ class DRPlatformConsistencyTest {
         String username = marker + "_USR";
 
         // 1) 源库插入一行 order + 一行 user
-        execute(SRC_HOST, "geo_source",
+        execute(SRC_PORT, "geo_source",
                 "INSERT INTO t_order (order_no,user_id,amount,status,remark) VALUES ('" + orderNo + "',7777,12.34,1,'it') "
                         + "ON DUPLICATE KEY UPDATE amount=12.34");
-        execute(SRC_HOST, "geo_source",
+        execute(SRC_PORT, "geo_source",
                 "INSERT INTO t_user (username,age,email) VALUES ('" + username + "',30,'it@x.com') "
                         + "ON DUPLICATE KEY UPDATE age=30");
 
-        // 2) 等待同步（同名库镜像到灾备主机 192.168.88.88）
+        // 2) 等待同步（同名库镜像到灾备主机 13307）
         boolean inserted = waitFor(() -> {
-            long src = count(SRC_HOST, "geo_source", "t_order", "order_no='" + orderNo + "'")
-                    + count(SRC_HOST, "geo_source", "t_user", "username='" + username + "'");
-            long tgt = count(TGT_HOST, "geo_source", "t_order", "order_no='" + orderNo + "'")
-                    + count(TGT_HOST, "geo_source", "t_user", "username='" + username + "'");
+            long src = count(SRC_PORT, "geo_source", "t_order", "order_no='" + orderNo + "'")
+                    + count(SRC_PORT, "geo_source", "t_user", "username='" + username + "'");
+            long tgt = count(TGT_PORT, "geo_source", "t_order", "order_no='" + orderNo + "'")
+                    + count(TGT_PORT, "geo_source", "t_user", "username='" + username + "'");
             return src == 2 && tgt == 2;
-        }, Duration.ofSeconds(30));
+        }, Duration.ofSeconds(60));
         assertTrue(inserted, "插入后灾备主机应与源主机一致(各 1 行)");
 
         // 3) 整体行数一致性：源 == 灾备（同名库）
         boolean consistent = waitFor(() ->
-                count(SRC_HOST, "geo_source", "t_order", null) == count(TGT_HOST, "geo_source", "t_order", null)
-                        && count(SRC_HOST, "geo_source", "t_user", null) == count(TGT_HOST, "geo_source", "t_user", null),
-                Duration.ofSeconds(30));
+                count(SRC_PORT, "geo_source", "t_order", null) == count(TGT_PORT, "geo_source", "t_order", null)
+                        && count(SRC_PORT, "geo_source", "t_user", null) == count(TGT_PORT, "geo_source", "t_user", null),
+                Duration.ofSeconds(60));
         assertTrue(consistent, "t_order / t_user 源/灾备整体行数应一致");
 
-        // 4) 源库删除这两行 -> 灾备库应通过对账删除
-        execute(SRC_HOST, "geo_source", "DELETE FROM t_order WHERE order_no='" + orderNo + "'");
-        execute(SRC_HOST, "geo_source", "DELETE FROM t_user WHERE username='" + username + "'");
+        // 4) 源库删除这两行 -> 灾备库应同步删除
+        execute(SRC_PORT, "geo_source", "DELETE FROM t_order WHERE order_no='" + orderNo + "'");
+        execute(SRC_PORT, "geo_source", "DELETE FROM t_user WHERE username='" + username + "'");
 
         boolean deleted = waitFor(() ->
-                count(TGT_HOST, "geo_source", "t_order", "order_no='" + orderNo + "'") == 0
-                        && count(TGT_HOST, "geo_source", "t_user", "username='" + username + "'") == 0,
-                Duration.ofSeconds(30));
-        assertTrue(deleted, "源库删除后，灾备库应通过删除对账移除对应行");
+                count(TGT_PORT, "geo_source", "t_order", "order_no='" + orderNo + "'") == 0
+                        && count(TGT_PORT, "geo_source", "t_user", "username='" + username + "'") == 0,
+                Duration.ofSeconds(60));
+        assertTrue(deleted, "源库删除后，灾备库应同步移除对应行");
 
         // 5) 清理（确保测试可重复）
-        execute(SRC_HOST, "geo_source", "DELETE FROM t_order WHERE order_no='" + orderNo + "'");
-        execute(SRC_HOST, "geo_source", "DELETE FROM t_user WHERE username='" + username + "'");
-        execute(TGT_HOST, "geo_source", "DELETE FROM t_order WHERE order_no='" + orderNo + "'");
-        execute(TGT_HOST, "geo_source", "DELETE FROM t_user WHERE username='" + username + "'");
+        execute(SRC_PORT, "geo_source", "DELETE FROM t_order WHERE order_no='" + orderNo + "'");
+        execute(SRC_PORT, "geo_source", "DELETE FROM t_user WHERE username='" + username + "'");
+        execute(TGT_PORT, "geo_source", "DELETE FROM t_order WHERE order_no='" + orderNo + "'");
+        execute(TGT_PORT, "geo_source", "DELETE FROM t_user WHERE username='" + username + "'");
     }
 
     // ----------------------------- 多库同步测试（自动发现新库/新表 + 历史 + 实时） -----------------------------
@@ -180,61 +197,61 @@ class DRPlatformConsistencyTest {
     @Test
     void testMultiDatabaseHistoricalAndRealtime() {
         // 准备第二个库（生产中心 biz_source），灾备端由引擎按同名自动建库建表
-        execute(SRC_HOST, "mysql", "CREATE DATABASE IF NOT EXISTS biz_source");
-        execute(SRC_HOST, "biz_source",
+        execute(SRC_PORT, "mysql", "CREATE DATABASE IF NOT EXISTS biz_source");
+        execute(SRC_PORT, "biz_source",
                 "CREATE TABLE IF NOT EXISTS t_customer ("
                         + "id BIGINT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(64), phone VARCHAR(32), "
                         + "balance DECIMAL(10,2), create_time DATETIME DEFAULT CURRENT_TIMESTAMP, "
                         + "update_time DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
-        execute(SRC_HOST, "biz_source", "TRUNCATE TABLE t_customer");
+        execute(SRC_PORT, "biz_source", "TRUNCATE TABLE t_customer");
 
         // 1) 历史全量：预置 3 行，等待引擎首次全量扫描同步到灾备主机同名库
         for (int i = 1; i <= 3; i++) {
-            execute(SRC_HOST, "biz_source", "INSERT INTO t_customer (name,phone,balance) VALUES ('cust" + i + "','1380000000" + i + "'," + (100 * i) + ")");
+            execute(SRC_PORT, "biz_source", "INSERT INTO t_customer (name,phone,balance) VALUES ('cust" + i + "','1380000000" + i + "'," + (100 * i) + ")");
         }
         boolean historical = waitFor(() ->
-                count(SRC_HOST, "biz_source", "t_customer", null) == 3
-                        && count(TGT_HOST, "biz_source", "t_customer", null) == 3, Duration.ofSeconds(40));
-        assertTrue(historical, "历史全量同步：biz_source(127.0.0.1) 与 biz_source(192.168.88.88) 行数应一致(各 3)");
+                count(SRC_PORT, "biz_source", "t_customer", null) == 3
+                        && count(TGT_PORT, "biz_source", "t_customer", null) == 3, Duration.ofSeconds(60));
+        assertTrue(historical, "历史全量同步：biz_source(13306) 与 biz_source(13307) 行数应一致(各 3)");
 
         // 2) 实时插入
-        execute(SRC_HOST, "biz_source", "INSERT INTO t_customer (name,phone,balance) VALUES ('rt_live','13900000000',999.99)");
-        boolean inserted = waitFor(() -> count(TGT_HOST, "biz_source", "t_customer", "name='rt_live'") == 1, Duration.ofSeconds(30));
+        execute(SRC_PORT, "biz_source", "INSERT INTO t_customer (name,phone,balance) VALUES ('rt_live','13900000000',999.99)");
+        boolean inserted = waitFor(() -> count(TGT_PORT, "biz_source", "t_customer", "name='rt_live'") == 1, Duration.ofSeconds(60));
         assertTrue(inserted, "实时插入：新增行应同步到灾备主机");
 
-        // 3) 实时更新（通过 update_time 水位增量捕获）
-        execute(SRC_HOST, "biz_source", "UPDATE t_customer SET balance=888.88, update_time=NOW() WHERE name='rt_live'");
+        // 3) 实时更新
+        execute(SRC_PORT, "biz_source", "UPDATE t_customer SET balance=888.88 WHERE name='rt_live'");
         boolean updated = waitFor(() -> {
-            double b = queryDecimal(TGT_HOST, "biz_source", "t_customer", "name='rt_live'", "balance");
+            double b = queryDecimal(TGT_PORT, "biz_source", "t_customer", "name='rt_live'", "balance");
             return Math.abs(b - 888.88) < 0.01;
-        }, Duration.ofSeconds(30));
+        }, Duration.ofSeconds(60));
         assertTrue(updated, "实时更新：balance 变更应同步到灾备主机");
 
-        // 4) 实时删除（通过主键对账删除多余行）
-        execute(SRC_HOST, "biz_source", "DELETE FROM t_customer WHERE name='rt_live'");
-        boolean deleted = waitFor(() -> count(TGT_HOST, "biz_source", "t_customer", "name='rt_live'") == 0, Duration.ofSeconds(30));
-        assertTrue(deleted, "实时删除：源库删除后灾备主机应通过对账删除移除");
+        // 4) 实时删除
+        execute(SRC_PORT, "biz_source", "DELETE FROM t_customer WHERE name='rt_live'");
+        boolean deleted = waitFor(() -> count(TGT_PORT, "biz_source", "t_customer", "name='rt_live'") == 0, Duration.ofSeconds(60));
+        assertTrue(deleted, "实时删除：源库删除后灾备主机应同步移除");
 
         // 5) 多个库整体一致性：geo_source 各自源==灾备
         boolean geoConsistent = waitFor(() ->
-                (count(SRC_HOST, "geo_source", "t_order", null) + count(SRC_HOST, "geo_source", "t_user", null))
-                        == (count(TGT_HOST, "geo_source", "t_order", null) + count(TGT_HOST, "geo_source", "t_user", null)),
-                Duration.ofSeconds(30));
+                (count(SRC_PORT, "geo_source", "t_order", null) + count(SRC_PORT, "geo_source", "t_user", null))
+                        == (count(TGT_PORT, "geo_source", "t_order", null) + count(TGT_PORT, "geo_source", "t_user", null)),
+                Duration.ofSeconds(60));
         assertTrue(geoConsistent, "geo 库对源/灾备应一致");
-        assertEquals(3L, count(TGT_HOST, "biz_source", "t_customer", null), "biz 库对灾备应保留 3 行历史数据");
+        assertEquals(3L, count(TGT_PORT, "biz_source", "t_customer", null), "biz 库对灾备应保留 3 行历史数据");
 
         // 6) 清理
-        execute(SRC_HOST, "biz_source", "TRUNCATE TABLE t_customer");
-        execute(TGT_HOST, "biz_source", "TRUNCATE TABLE t_customer");
+        execute(SRC_PORT, "biz_source", "TRUNCATE TABLE t_customer");
+        execute(TGT_PORT, "biz_source", "TRUNCATE TABLE t_customer");
     }
 
     // ----------------------------- 页面动态配置 / 连接测试端点（主机对模型） -----------------------------
 
     @Test
     void testMappingConfigEndpoints() {
-        // 1) 连接测试（有效账号：127.0.0.1 -> 192.168.88.88 真实跨主机）
-        String testPayload = "{\"sourceHost\":\"127.0.0.1\",\"sourcePort\":3306,\"sourceUser\":\"root\",\"sourcePassword\":\"123456\","
-                + "\"targetHost\":\"192.168.88.88\",\"targetPort\":3306,\"targetUser\":\"root\",\"targetPassword\":\"123456\"}";
+        // 1) 连接测试（有效账号：生产中心 13306 -> 灾备中心 13307）
+        String testPayload = "{\"sourceHost\":\"127.0.0.1\",\"sourcePort\":" + SRC_PORT + ",\"sourceUser\":\"root\",\"sourcePassword\":\"123456\","
+                + "\"targetHost\":\"127.0.0.1\",\"targetPort\":" + TGT_PORT + ",\"targetUser\":\"root\",\"targetPassword\":\"123456\"}";
         ResponseEntity<Map> tr = rest.exchange(base() + "/sync/mapping/test", HttpMethod.POST,
                 new HttpEntity<>(testPayload, jsonHeaders()), Map.class);
         assertTrue(tr.getStatusCode().is2xxSuccessful(), "mapping/test 应 200");
@@ -244,24 +261,27 @@ class DRPlatformConsistencyTest {
         assertEquals(Boolean.TRUE, ((Map) tdata.get("source")).get("ok"), "源库连接应成功");
         assertEquals(Boolean.TRUE, ((Map) tdata.get("target")).get("ok"), "目标库连接应成功");
 
-        // 2) 列表应包含配置中的默认主机对
+        // 2) 列表应包含配置中的默认主机对（key 含端口）
         ResponseEntity<Map> lr = rest.getForEntity(base() + "/sync/mappings", Map.class);
         assertEquals("0", lr.getBody().get("code"));
         List<Map> list = (List<Map>) lr.getBody().get("data");
-        assertTrue(list.stream().anyMatch(m -> "127.0.0.1->192.168.88.88".equals(m.get("instanceKey"))),
-                "列表应包含默认主机对 127.0.0.1->192.168.88.88");
+        assertTrue(list.stream().anyMatch(m -> DEFAULT_KEY.equals(m.get("instanceKey"))),
+                "列表应包含默认主机对 " + DEFAULT_KEY);
 
-        // 3) 新增一个唯一主机对（127.0.0.1 -> 127.0.0.1，与默认不冲突且 localhost 可达）
-        String addPayload = "{\"sourceHost\":\"127.0.0.1\",\"sourcePort\":3306,\"sourceUser\":\"root\",\"sourcePassword\":\"123456\","
-                + "\"targetHost\":\"127.0.0.1\",\"targetPort\":3306,\"targetUser\":\"root\",\"targetPassword\":\"123456\"}";
+        // 3) 新增一个主机对用于 CRUD 验证。
+        //    源取「生产中心备库 13308」，并用 ignoreDatabases 忽略全部库 —— 新增映射会立刻拉起同步作业，
+        //    若不忽略，备库的存量数据会被灌进灾备库，污染其余用例的断言。
+        String key = HOST + ":" + STANDBY_PORT + "->" + HOST + ":" + TGT_PORT;
+        String addPayload = "{\"sourceHost\":\"127.0.0.1\",\"sourcePort\":" + STANDBY_PORT + ",\"sourceUser\":\"root\",\"sourcePassword\":\"123456\","
+                + "\"targetHost\":\"127.0.0.1\",\"targetPort\":" + TGT_PORT + ",\"targetUser\":\"root\",\"targetPassword\":\"123456\","
+                + "\"ignoreDatabases\":[\"re:^.*$\"]}";
         ResponseEntity<Map> ar = rest.exchange(base() + "/sync/mapping/add", HttpMethod.POST,
                 new HttpEntity<>(addPayload, jsonHeaders()), Map.class);
         assertTrue(ar.getStatusCode().is2xxSuccessful(), "mapping/add 应 200");
         assertEquals("0", ar.getBody().get("code"), "新增主机对应成功");
         List<String> created = (List<String>) ((Map) ar.getBody().get("data")).get("created");
         assertNotNull(created);
-        assertTrue(created.contains("127.0.0.1->127.0.0.1"), "created 应包含新主机对 key");
-        String key = "127.0.0.1->127.0.0.1";
+        assertTrue(created.contains(key), "created 应包含新主机对 key: " + key);
 
         // 4) 重复新增应被拦截
         ResponseEntity<Map> ar2 = rest.exchange(base() + "/sync/mapping/add", HttpMethod.POST,
@@ -285,17 +305,17 @@ class DRPlatformConsistencyTest {
         assertTrue(list3.stream().noneMatch(m -> key.equals(m.get("instanceKey"))), "移除后列表不应再包含该映射");
     }
 
-    // ----------------------------- JDBC 工具（支持指定主机） -----------------------------
+    // ----------------------------- JDBC 工具（按端口区分实例） -----------------------------
 
-    private String url(String host, String db) {
-        return "jdbc:mysql://" + host + ":3306/" + db
+    private String url(int port, String db) {
+        return "jdbc:mysql://127.0.0.1:" + port + "/" + db
                 + "?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false";
     }
 
-    private void execute(String host, String db, String sql) {
+    private void execute(int port, String db, String sql) {
         try {
             Class.forName("com.mysql.cj.jdbc.Driver");
-            try (Connection c = DriverManager.getConnection(url(host, db), USER, PASS);
+            try (Connection c = DriverManager.getConnection(url(port, db), USER, PASS);
                  Statement st = c.createStatement()) {
                 st.execute(sql);
             }
@@ -304,11 +324,11 @@ class DRPlatformConsistencyTest {
         }
     }
 
-    private long count(String host, String db, String table, String where) {
+    private long count(int port, String db, String table, String where) {
         try {
             Class.forName("com.mysql.cj.jdbc.Driver");
             String sql = "SELECT COUNT(1) FROM `" + table + "`" + (where == null ? "" : " WHERE " + where);
-            try (Connection c = DriverManager.getConnection(url(host, db), USER, PASS);
+            try (Connection c = DriverManager.getConnection(url(port, db), USER, PASS);
                  Statement st = c.createStatement();
                  ResultSet rs = st.executeQuery(sql)) {
                 return rs.next() ? rs.getLong(1) : 0;
@@ -318,11 +338,11 @@ class DRPlatformConsistencyTest {
         }
     }
 
-    private double queryDecimal(String host, String db, String table, String where, String column) {
+    private double queryDecimal(int port, String db, String table, String where, String column) {
         try {
             Class.forName("com.mysql.cj.jdbc.Driver");
             String sql = "SELECT `" + column + "` FROM `" + table + "`" + (where == null ? "" : " WHERE " + where);
-            try (Connection c = DriverManager.getConnection(url(host, db), USER, PASS);
+            try (Connection c = DriverManager.getConnection(url(port, db), USER, PASS);
                  Statement st = c.createStatement();
                  ResultSet rs = st.executeQuery(sql)) {
                 return rs.next() ? rs.getDouble(1) : Double.NaN;

@@ -1,7 +1,14 @@
 # ===================== 自动化一致性测试专用 profile =====================
-# 本环境 192.168.88.88:3306 真实可达（root/123456），故直接演示"跨主机灾备"：
-# 源主机 127.0.0.1 下的所有用户库，会以同名镜像方式实时同步到灾备主机 192.168.88.88。
-# 忽略 DRPlatform 元数据库，避免把生产中心的管控库反向同步到灾备中心自身元库。
+# 早期版本依赖一台远程机 192.168.88.88:3306 做「跨主机灾备」验证，该主机现已离线，
+# 测试不可复现。现统一改用本机 Docker 容器（root/123456），三个实例同在 127.0.0.1，
+# 靠端口区分，更利于在 CI/本机随时复跑：
+#   drp-src-mysql          127.0.0.1:13306  生产中心主库（binlog ROW）
+#   drp-src-standby-mysql  127.0.0.1:13308  生产中心备库（主备切换演练用）
+#   drp-tgt-mysql          127.0.0.1:13307  灾备中心
+# 忽略 DRPlatform 元数据库，避免把管控库反向同步到灾备中心自身元库。
+#
+# 注意：本 profile 与 application.yml 共用 drplatform.sync.mode=flink-cdc，
+# 因此一致性测试走的是与生产完全相同的 binlog 链路，而非轮询兜底路径。
 
 # 测试环境关闭会话鉴权拦截器，聚焦同步一致性与 REST 契约验证（生产默认开启）
 app:
@@ -11,16 +18,19 @@ app:
 drplatform:
   mappings:
     - source-host: 127.0.0.1
-      source-port: 3306
+      source-port: 13306
       source-user: root
       source-password: 123456
-      target-host: 192.168.88.88
-      target-port: 3306
+      target-host: 127.0.0.1
+      target-port: 13307
       target-user: root
       target-password: 123456
-      # 测试环境的 127.0.0.1 上存在大量与本测试无关的业务库（其中 rfm_db 达 29 万+ 行），
-      # 若全部纳入同步，单个轮询周期会被大库的全表扫描 + 主键对账拖到数分钟，
-      # 导致测试库 geo_source / biz_source 在断言超时窗口（30~40s）内轮不到同步。
+      # 备源（主备切换）：切换时源地址与备源地址互换，可反复来回执行
+      source-standby-host: 127.0.0.1
+      source-standby-port: 13308
+      # 源容器上存在大量与本测试无关的业务库（其中 rfm_db 达 29 万+ 行），
+      # 若全部纳入同步，单个快照周期会被大表的全量扫描拖到数分钟，
+      # 导致测试库 geo_source / biz_source 在断言超时窗口（30~40s）内同步不完。
       # 故用负向前瞻正则「仅保留 geo_source 与 biz_source，忽略其余所有用户库」，
       # 保证每个周期只处理这两个测试库、秒级追平（这也顺带验证了正则忽略能力）。
       ignore-databases:

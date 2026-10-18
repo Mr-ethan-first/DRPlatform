@@ -3,6 +3,7 @@ package com.example.remotedatasync.bean;
 import lombok.Data;
 
 import java.io.Serializable;
+import java.time.LocalDateTime;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -32,6 +33,16 @@ public class RowChange implements Serializable {
     private Map<String, Object> after = new LinkedHashMap<>();
     /** 主键列名（用于幂等 upsert 与分区路由） */
     private List<String> primaryKeyColumns;
+
+    /**
+     * 本行续扫锚点：update_time（用于增量水位推进）。
+     * 由同步引擎在扫描源库时按行填充，随事件流经 Sink，落库成功后回灌为水位。
+     */
+    private transient LocalDateTime watermarkTime;
+    /**
+     * 本行续扫锚点：主键列的值（与 watermarkTime 构成 keyset 续扫点）。
+     */
+    private transient Object watermarkKey;
 
     public RowChange() {
     }

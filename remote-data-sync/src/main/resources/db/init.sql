@@ -80,6 +80,22 @@ CREATE TABLE IF NOT EXISTS sync_restart_task (
     UNIQUE KEY IDX_UNIQUE_KEY (SOURCE_HOST, SOURCE_DB, TARGET_HOST, TARGET_DB)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- -------------------- 同步水位（断点续传 / 崩溃恢复核心） --------------------
+-- 记录每张表「已确认落库」的最大 (update_time, 主键) 水位，由同步引擎在目标库事务提交成功后推进并持久化。
+-- 断电 / 进程崩溃 / 灾备中心重启后，引擎从该表加载水位做增量续传，而非全表重扫。
+-- 水位语义：仅当目标库批次写入成功提交后才推进 → 绝不会越过未落库的数据 → 保证 at-least-once 不丢。
+CREATE TABLE IF NOT EXISTS sync_watermark (
+    ID              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    SOURCE_IP       VARCHAR(45)  NOT NULL COMMENT '生产中心（源）IP',
+    SOURCE_DB       VARCHAR(64)  NOT NULL COMMENT '源库名',
+    TABLE_NAME      VARCHAR(64)  NOT NULL COMMENT '源表名',
+    WATERMARK_TIME  DATETIME     NOT NULL COMMENT '已确认落库的最大 update_time',
+    WATERMARK_KEY   VARCHAR(255) DEFAULT NULL COMMENT '续扫主键锚点（末位行主键值，与 WATERMARK_TIME 构成 keyset）',
+    UPDATE_TIME     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (ID),
+    UNIQUE KEY IDX_WM (SOURCE_IP, SOURCE_DB, TABLE_NAME)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- -------------------- 后台管理用户 --------------------
 CREATE TABLE IF NOT EXISTS sys_user (
     ID             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -172,3 +188,36 @@ CREATE TABLE IF NOT EXISTS t_customer (
     PRIMARY KEY (id),
     UNIQUE KEY uk_name (name)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 操作日志表（OperationLogAspect 持久化审计日志；缺失时仅 WARN 不阻塞同步）
+CREATE TABLE IF NOT EXISTS operation_log (
+    id              BIGINT       NOT NULL AUTO_INCREMENT,
+    user_id         BIGINT       DEFAULT NULL,
+    username        VARCHAR(64)  DEFAULT NULL,
+    operation_type  VARCHAR(64)  DEFAULT NULL,
+    operation_desc  VARCHAR(255) DEFAULT NULL,
+    target_resource VARCHAR(255) DEFAULT NULL,
+    client_ip       VARCHAR(64)  DEFAULT NULL,
+    request_url     VARCHAR(512) DEFAULT NULL,
+    request_method  VARCHAR(16)  DEFAULT NULL,
+    request_params  TEXT         DEFAULT NULL,
+    result_status   VARCHAR(32)  DEFAULT NULL,
+    error_msg       TEXT         DEFAULT NULL,
+    duration_ms     BIGINT       DEFAULT NULL,
+    create_time     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    KEY idx_ot (operation_type),
+    KEY idx_ct (create_time)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- CDC（Flink binlog 同步引擎）作业状态表：jobId / savepoint 路径 / 运行状态
+-- 崩溃恢复优先级：显式 savepoint -> retained checkpoint -> INITIAL 全量
+CREATE TABLE IF NOT EXISTS cdc_job_state (
+    instance_key   VARCHAR(128)  NOT NULL COMMENT '主机对实例key(sourceHost:port->targetHost:port)',
+    job_id         VARCHAR(64)   DEFAULT NULL COMMENT 'Flink 作业ID',
+    savepoint_path VARCHAR(512)  DEFAULT NULL COMMENT '最近一次 savepoint 路径',
+    state          VARCHAR(32)   DEFAULT NULL COMMENT 'RUNNING/STOPPED/FAILED',
+    last_error     VARCHAR(1024) DEFAULT NULL COMMENT '最近一次错误',
+    updated_at     TIMESTAMP     NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (instance_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='CDC 作业状态（savepoint 恢复）';

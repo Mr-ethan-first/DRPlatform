@@ -42,6 +42,10 @@ public class DatabaseMapping implements Serializable {
     private String targetUser;
     private String targetPassword;
 
+    /** 备源主机（生产中心主备切换用，可选）：主库不可用时切到此地址继续同步 */
+    private String sourceStandbyHost;
+    private int sourceStandbyPort = 3306;
+
     /** 整库跳过（不扫描、不同步），支持多个 + 正则（见 MatchPattern） */
     private List<String> ignoreDatabases = new ArrayList<>();
 
@@ -96,8 +100,34 @@ public class DatabaseMapping implements Serializable {
         return new DatabaseConfig(targetHost, targetPort, targetUser, targetPassword, dbName);
     }
 
-    /** 实例 key：sourceHost->targetHost（主机对唯一） */
+    /**
+     * 实例 key：{@code sourceHost:sourcePort->targetHost:targetPort}（主机对唯一）。
+     * <p>
+     * <b>必须包含端口</b>：早期版本只用 IP 拼接，在同一主机多实例场景（如容器化验证环境
+     * 全部落在 127.0.0.1，仅靠 13306/13307/13308 区分）下会得到完全相同的 key，导致
+     * 「生产中心↔灾备中心互换」「主备切换」时新旧作业共用同一 key，
+     * 表现为新作业被 {@code jobs.containsKey(key)} 静默跳过、旧 savepoint 被新方向错误复用。
+     * </p>
+     */
     public String getInstanceKey() {
+        return sourceHost + ":" + sourcePort + "->" + targetHost + ":" + targetPort;
+    }
+
+    /** 仅含 IP 的兼容 key（旧接口入参/页面展示用）：sourceHost->targetHost */
+    public String getHostOnlyKey() {
         return sourceHost + "->" + targetHost;
+    }
+
+    /**
+     * 物理链路 key（<b>无序</b>）：同一对主机无论正/反方向都得到同一个 key。
+     * <p>
+     * 用于识别「同一条灾备链路的角色互换」：生产↔灾备互换后 instanceKey 变了，
+     * 但物理链路没变，因此恢复持久化状态时可以用它去重，避免重启后同时启动正反两个作业。
+     * </p>
+     */
+    public String getLinkKey() {
+        String a = sourceHost + ":" + sourcePort;
+        String b = targetHost + ":" + targetPort;
+        return a.compareTo(b) <= 0 ? a + "|" + b : b + "|" + a;
     }
 }

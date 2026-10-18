@@ -65,3 +65,16 @@ desktop.ini
 # ===== 其他 =====
 HELP.md
 修改建议.txt
+
+# ===== 运行时/调试产物（非源码，不入仓） =====
+# 页面动态新增的主机对映射（运行时状态，重启不丢，但非源码）
+geodrsync-dynamic-mappings.json
+# Flink CDC / 应用运行时 checkpoint、savepoint
+savepoints/
+# 反编译/提取的第三方 CDC 库源码缓存（非项目代码）
+_cdc_sources/
+# 临时 Flink 冒烟测试（含 classes/ 编译产物、smoke-run.log、run/savepoints）
+tests/flinksmoke/
+# 性能压测报告产物
+tests/perf-report.txt
+tests/perf-storm-report.txt

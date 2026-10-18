@@ -114,10 +114,42 @@ def wait_mysql(c, timeout=60):
     raise AssertionError(f"MySQL {c['host']}:{c['port']} 在 {timeout}s 内不可达")
 
 
+def _run_native(cmd, timeout=30):
+    """调用 Windows 原生命令。
+
+    关键：绝不使用 text=True。中文 Windows 下 PowerShell/tasklist 等按 GBK 输出，
+    而本进程 stdout 编码为 UTF-8，text=True 会在 subprocess 的 reader 线程里抛
+    UnicodeDecodeError —— 异常不冒泡，调用方只看到 stdout 为空，
+    从而把「命令失败/有告警」误判为「进程不存在」（静默假阴性）。
+    统一取 bytes 后用 errors="replace" 宽容解码。
+    """
+    r = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    return r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
+
+
 def find_app_pid():
-    ps = r"Get-NetTCPConnection -LocalPort 8899 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess"
-    out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                         capture_output=True, text=True, timeout=30).stdout
+    """查找监听 8899 的进程 PID。找不到返回 None。
+
+    主路径用 netstat -ano（Windows 输出为英文状态名，纯 ASCII，不受 GBK 编码影响）；
+    仅当 netstat 不可用时回退 PowerShell（并做宽容解码）。
+    """
+    rc, out, _ = _run_native(["netstat", "-ano", "-p", "TCP"])
+    if rc == 0 and out:
+        for line in out.splitlines():
+            parts = line.split()
+            # TCP  <local> <foreign> <state> <pid>
+            if len(parts) >= 5 and parts[0].upper() == "TCP":
+                local, state = parts[1], parts[3].upper()
+                if state == "LISTENING" and local.rsplit(":", 1)[-1] == "8899":
+                    try:
+                        return int(parts[4])
+                    except ValueError:
+                        continue
+        return None
+    # 回退：PowerShell（宽容解码）
+    ps = (r"Get-NetTCPConnection -LocalPort 8899 -State Listen -ErrorAction SilentlyContinue "
+          r"| Select-Object -ExpandProperty OwningProcess")
+    _, out, _ = _run_native(["powershell", "-NoProfile", "-Command", ps])
     for line in out.splitlines():
         line = line.strip()
         if line.isdigit():
@@ -126,31 +158,38 @@ def find_app_pid():
 
 
 def _kill_pid(pid):
+    """强杀 PID：先 Stop-Process，失败再退回 taskkill（list 形式，不过 shell，无斜杠坑）。"""
     if not pid:
         return
-    subprocess.run(["powershell", "-NoProfile", "-Command", f"Stop-Process -Id {pid} -Force"],
-                   capture_output=True, timeout=30)
+    rc, _, err = _run_native(["powershell", "-NoProfile", "-Command",
+                              f"Stop-Process -Id {pid} -Force"])
+    if rc != 0:
+        _run_native(["taskkill", "/F", "/PID", str(pid)])
+    time.sleep(1)
 
 
-def stop_app():
-    """停止托管的同步服务。优先用精确跟踪的 Popen PID，回退到端口反查。"""
+def stop_app(timeout=60):
+    """停止同步服务，并确保 8899 端口确实无人监听后才返回 True。
+
+    必须反复扫描端口并杀掉所有占用者 —— 上一轮运行残留的实例若不被清理，
+    新实例会因端口被占而静默起不来，导致后续断言误判。
+    """
     global _APP_PROC
-    killed = False
     if _APP_PROC is not None and _APP_PROC.poll() is None:
         _kill_pid(_APP_PROC.pid)
-        killed = True
-    # 兜底：若端口上仍有残留监听（例如上一次运行遗留），一并清理
-    pid = find_app_pid()
-    if pid:
-        _kill_pid(pid)
-        killed = True
-    for _ in range(20):
-        time.sleep(1)
-        if (_APP_PROC is None or _APP_PROC.poll() is not None) and find_app_pid() is None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        pid = find_app_pid()
+        if pid is not None:
+            _kill_pid(pid)
+            continue
+        # 端口无人监听：确认 Popen 记录的进程也已退出
+        if _APP_PROC is None or _APP_PROC.poll() is not None:
             _APP_PROC = None
             return True
+        time.sleep(1)
     _APP_PROC = None
-    return killed
+    return find_app_pid() is None
 
 
 def start_app():
@@ -163,30 +202,48 @@ def start_app():
     env = dict(os.environ, SPRING_PROFILES_ACTIVE="dockerlab")
     env.pop("SERVER__PORT", None)
     env.pop("SERVER_PORT", None)
-    # 启动时若 8899 已被占用，先清掉残留，避免端口冲突
-    occ = find_app_pid()
-    if occ:
+    # 启动前彻底清空 8899：残留实例会占住端口，导致新实例静默起不来
+    for _ in range(10):
+        occ = find_app_pid()
+        if occ is None:
+            break
         _kill_pid(occ)
-        time.sleep(2)
     with open(APP_LOG, "a", encoding="utf-8") as log:
         _APP_PROC = subprocess.Popen([JAVA, "-jar", APP_JAR, "--server.port=8899"],
                                      cwd=APP_CWD, env=env, stdout=log, stderr=subprocess.STDOUT)
     # 等待登录可用（Spring Boot 启动 + 引擎初始化）
-    deadline = time.time() + 120
+    deadline = time.time() + 180
     while time.time() < deadline:
         time.sleep(3)
         if _APP_PROC.poll() is not None:
             raise RuntimeError(f"同步服务进程意外退出（exit={_APP_PROC.poll()}），见 {APP_LOG}")
         try:
             _login()
-            return True
         except Exception:
-            pass
-    raise RuntimeError("同步服务启动超时（120s）")
+            continue  # 应用尚未就绪，继续等待（登录断言失败不是致命错误）
+        # 登录成功后再校验端口归属，避免被残留实例「冒充」就绪
+        holder = find_app_pid()
+        if holder is not None and holder != _APP_PROC.pid:
+            raise RuntimeError(f"8899 监听进程 {holder} 与本次启动的 {_APP_PROC.pid} 不一致（存在残留实例）")
+        return True
+    raise RuntimeError("同步服务启动超时（180s）")
+
+
+def _direct_session():
+    """绕过本机 HTTP_PROXY 直连 127.0.0.1。
+
+    本机存在 HTTP_PROXY=http://127.0.0.1:3195 且未配 no_proxy，
+    requests 默认会把 127.0.0.1:8899 也发给代理，应用未就绪时返回
+    502 upstream connect failed（os error 10061），把「应用还在启动」误判成登录失败。
+    trust_env=False 可彻底禁用环境代理。
+    """
+    s = requests.Session()
+    s.trust_env = False
+    return s
 
 
 def _login(base=LAB_BASE_URL):
-    s = requests.Session()
+    s = _direct_session()
     s.headers.update({"Content-Type": "application/json"})
     r = s.post(f"{base}/auth/login", json={"username": ADMIN_USER, "password": ADMIN_PASS}, timeout=20)
     assert r.status_code == 200, f"登录失败 {r.status_code}: {r.text[:200]}"
@@ -198,11 +255,11 @@ def app_alive():
     """服务存活探针：管控接口能否响应。
 
     注意：dockerlab profile 开启了鉴权，/sync/status 在「未携带凭证」时返回 401，
-    但 401 同样是『服务在响应』的证明（只是需要登录）。因此只要能拿到任意 HTTP 响应
-    （200/401/...）即视为存活；只有连接被拒绝 / 超时（服务进程不在）才是真正的宕机。
+    但 401 同样是『服务在响应』的证明。因此只要能拿到任意 HTTP 响应即视为存活；
+    只有连接被拒绝 / 超时（服务进程不在）才是真正的宕机。
     """
     try:
-        requests.get(f"{LAB_BASE_URL}/sync/status", timeout=10)
+        _direct_session().get(f"{LAB_BASE_URL}/sync/status", timeout=10)
         return True
     except Exception:
         return False

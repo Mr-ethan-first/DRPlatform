@@ -3,7 +3,7 @@
 
 同步引擎会自动同步源主机所有用户库到目标主机（排除系统库与 ignoreDatabases）。
 
-由于默认映射 127.0.0.1->192.168.88.88 已存在于 application.yml，无法重复添加
+由于默认映射 默认主机对已存在于 application.yml，无法重复添加
 （返回 MAPPING_ALREADY_EXISTS），本测试采用简化方案：
 1. 直查 DRPlatform.sync_progress 表验证系统库（information_schema / mysql /
    performance_schema / sys / DRPlatform）未被同步、用户库已被同步。
@@ -86,7 +86,7 @@ class TestIgnoreDatabases:
 class TestIgnoreTables:
     """表忽略规则的 API 参数校验。
 
-    由于默认映射 127.0.0.1->192.168.88.88 已存在，添加相同映射会返回
+    由于默认映射 默认主机对已存在，添加相同映射会返回
     MAPPING_ALREADY_EXISTS。若 ignoreDatabases / ignoreTables 参数格式
     不合法，后端会先返回 PARAM_ERROR。因此：返回 ALREADY_EXISTS 即证明
     忽略规则参数被接口正确接受。

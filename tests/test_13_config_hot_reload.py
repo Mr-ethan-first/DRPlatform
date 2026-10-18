@@ -46,12 +46,18 @@ def _find_mapping_by_host(mappings, source_host):
 
 
 def _get_default_mapping_key(auth):
-    """获取默认配置的 mapping instanceKey（127.0.0.1->192.168.88.88）。"""
+    """
+    获取默认配置的 mapping instanceKey。
+
+    注意：instanceKey 现为「host:port->host:port」格式（含端口），
+    早期版本只用 IP 拼接，在同一主机多实例场景（容器化环境）下会撞 key。
+    这里统一从接口返回值的 instanceKey 取，不手工拼接。
+    """
     mappings, _ = _list_mappings(auth)
     m = _find_mapping_by_host(mappings, "127.0.0.1")
     if m is None:
-        pytest.skip("未找到默认 mapping 127.0.0.1->192.168.88.88")
-    return m.get("instanceKey") or f"{m['sourceHost']}->{m['targetHost']}"
+        pytest.skip("未找到源主机为 127.0.0.1 的默认 mapping")
+    return m.get("instanceKey") or f"{m['sourceHost']}:{m['sourcePort']}->{m['targetHost']}:{m['targetPort']}"
 
 
 def _remote_table_exists(db_name, table_name):

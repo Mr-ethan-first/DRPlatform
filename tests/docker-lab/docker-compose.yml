@@ -1,14 +1,17 @@
 # DRPlatform 异地灾备同步 —— 隔离式故障注入测试实验室
-# 用途：在不触碰生产/远程部署的前提下，用 Docker 起「源 MySQL」「目标 MySQL」两个独立实例，
-#       真实模拟『源库宕机 / 目标库宕机 / 同步服务进程被杀重启』等断电/断网异常场景，
+# 用途：在不触碰生产/远程部署的前提下，用 Docker 起「源主库 / 源备库 / 目标库」三个独立实例，
+#       真实模拟『源库宕机 / 断网』『目标库宕机 / 断网』『同步服务进程被杀重启』『主备切换』
+#       『binlog 失效删除(PURGE/RESET)』等断电/断网/主备异常场景，
 #       验证数据最终一致性与服务健壮性。
 #
 # 启动： docker compose -f tests/docker-lab/docker-compose.yml up -d
 # 停止： docker compose -f tests/docker-lab/docker-compose.yml down
-# 注意： 同步服务(remote-data-sync)本身在宿主机本地运行（非容器），通过 127.0.0.1:13306 / 13307 访问这两个库。
+# 注意： 同步服务(remote-data-sync)本身在宿主机本地运行（非容器），通过 127.0.0.1:13306 / 13308 / 13307 访问这三个库。
+#       管控面元数据库(drplatform)仍用宿主机本地 127.0.0.1:3306（需提前执行 db/init.sql 建表）。
 version: "3.8"
 
 services:
+  # -------------------- 生产中心：源主库 --------------------
   src-mysql:
     image: mysql:8.0
     container_name: drp-src-mysql
@@ -19,6 +22,11 @@ services:
       - --default-authentication-plugin=mysql_native_password
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_general_ci
+      # 开启 binlog（用于验证「源库 binlog 被 PURGE/RESET 失效删除」后，基于 update_time 轮询的同步架构天然免疫）
+      - --log-bin=mysql-bin
+      - --server-id=1
+      - --binlog-format=ROW
+      - --binlog-expire-logs-seconds=3600
     ports:
       - "13306:3306"
     volumes:
@@ -32,6 +40,39 @@ services:
       start_period: 30s
     restart: "no"
 
+  # -------------------- 生产中心：源备库（主备切换演练用） --------------------
+  # 默认空库，测试在「主库故障」前将主库数据克隆进备库，再调用 /sync/mapping/switchSource 把同步源切到备库。
+  src-standby-mysql:
+    image: mysql:8.0
+    container_name: drp-src-standby-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: "123456"
+      MYSQL_INITDB_SKIP_TZINFO: "1"
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_general_ci
+      # 必须开 binlog：主备切换后本实例会成为新的同步源，Flink CDC 需要以 ROW 格式读取其变更。
+      # 早期版本只给了 server-id，容器一旦被重建，备源将拿不到 binlog，切换后作业直接 FAILED。
+      - --log-bin=mysql-bin
+      - --server-id=2
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --binlog-expire-logs-seconds=3600
+    ports:
+      - "13308:3306"
+    volumes:
+      - ./init-src.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - src-standby-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p123456"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    restart: "no"
+
+  # -------------------- 灾备中心：目标库 --------------------
   tgt-mysql:
     image: mysql:8.0
     container_name: drp-tgt-mysql
@@ -42,6 +83,14 @@ services:
       - --default-authentication-plugin=mysql_native_password
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_general_ci
+      # 灾备库同样必须开 binlog：执行「灾备中心切生产中心」后本实例会提升为新的同步源，
+      # 若没有 binlog，反向同步无法建立（Flink CDC 快照能过，但增量阶段必失败）。
+      # server-id 需与源库不同，便于未来直接搭建 主->备 的原生复制链路。
+      - --log-bin=mysql-bin
+      - --server-id=3
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --binlog-expire-logs-seconds=3600
     ports:
       - "13307:3306"
     volumes:
@@ -56,4 +105,5 @@ services:
 
 volumes:
   src-data:
+  src-standby-data:
   tgt-data:

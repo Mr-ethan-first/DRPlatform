@@ -59,32 +59,88 @@ drplatform:
     max-queue-size: 20000
     reconcile-interval-ms: 10000
     deviation-timeout-sec: 300
+  # ===================== 同步引擎模式 =====================
+  # flink-cdc（默认）：基于 MySQL binlog 的全量+增量同步。
+  #   - 运行期零轮询查询源库（仅 1 条复制连接/源主机，事件推送即用）
+  #   - checkpoint 持久化 binlog 位点 → 崩溃恢复 = 从位点续传（at-least-once + 幂等 = 不丢不重）
+  #   - 显式 savepoint：API/优雅停机触发 flush→落库→写位点→停，可随时恢复
+  #   - 首次全量为一次性分块快照（标准 CDC 行为），之后 100% binlog；实时延迟亚秒级（目标 <10s）
+  # polling：旧轮询水位引擎（仅用于无 REPLICATION 权限的源，兜底）
+  sync:
+    mode: flink-cdc
+  # Flink CDC（binlog 同步引擎）参数
+  cdc:
+    # checkpoint 间隔：binlog 位点随 checkpoint 落盘，决定崩溃恢复粒度与 savepoint 频率
+    checkpoint-interval-ms: 3000
+    # savepoint 根目录（每主机对一个子目录；Linux 部署建议 /data/DRPlatform/savepoint）
+    savepoint-path: savepoints
+    # 作业并行度（快照分片与 binlog 读取并行度）
+    parallelism: 2
+    # 内嵌 TaskManager 内存（MiniCluster 与 JM 同 JVM，JVM 堆需 > 该值 + Spring 上下文）
+    taskmanager-memory: 1024m
+    # 快照分片大小（行）：大表切片并行度
+    snapshot-chunk-size: 8096
+    # 快照读取 fetch size
+    fetch-size: 2048
+    # 源库服务器时区：必须与源库实际时区一致，否则时序列字面量会整体偏移
+    # （容器化 MySQL 通常为 UTC；Linux 主机部署通常为 Asia/Shanghai）
+    server-time-zone: UTC
+    # 心跳间隔（秒）：空闲时也推进 checkpoint 位点
+    heartbeat-interval-sec: 3
+    # 是否同步 binlog 中的 DDL（表结构变更）
+    include-schema-changes: true
+    # 是否自动发现源库新增表
+    scan-newly-added-table: true
+    # 源库结构巡检间隔（秒）：flink-cdc 运行期不探测新库/新表，由本层巡检发现后
+    # 自动打 savepoint 并重启作业纳入（0 表示关闭）
+    discovery-interval-sec: 20
+    # 巡检触发重启的冷却时间（秒）
+    discovery-restart-cooldown-sec: 30
+    # sink 批大小（行）：达到即 flush，兼顾延迟与吞吐
+    sink-batch-size: 500
+    # 每目标库共享连接池上限（空闲自动回收）
+    sink-pool-size: 2
+    # 源侧 flink-cdc 内部连接池大小
+    source-connection-pool-size: 4
+    # 复制连接 server-id 基址（每映射派生唯一值，避免与源库其他从库冲突）
+    server-id-base: 60000
+    # 实时延迟告警阈值（秒）
+    lag-warn-seconds: 10
   # 数据库连接池上限（全局信号量）
   connection:
     max-pool-size: 32
     max-global-connections: 200
+  # 主备切换（HA）：true 时检测到 dbha_switch_status 记录后自动将同步源切到备库；默认 false（人工/API 触发）
+  ha:
+    switch-auto-resync: false
   # 数据库映射：生产中心主机 -> 灾备中心主机（主机对，1:1 异地备份）
   # 该源主机下所有用户库与表将被自动同步（系统库与 ignoreDatabases 除外），无需逐项勾选；
   # 新增的库 / 表会在下一轮扫描中实时纳入。可配置多组主机对以实现多服务器异地备份。
   mappings:
     - source-host: 127.0.0.1
-      source-port: 3306
+      source-port: 13306
       source-user: root
       source-password: 123456
-      target-host: 192.168.88.88
-      target-port: 3306
+      target-host: 127.0.0.1
+      target-port: 13307
       target-user: root
       target-password: 123456
+      # 备源（主备切换 HA）：切换时源地址与备源地址互换，可反复来回执行
+      source-standby-host: 127.0.0.1
+      source-standby-port: 13308
       # 整库忽略（支持多个 + 正则，如 re:^tmp_.*）；为空则同步全部用户库
-      # day02 含 258 万行 areas 表，rfm_db 含 102 万行，day01 含 159 万行 test_table；
-      # 全量同步耗时长且阻塞后续小库，因此忽略
-      ignore-databases: ["day02", "rfm_db", "day01"]
+      ignore-databases: []
+      # 字段内容转换规则示例（同步写入目标库前替换命中值；库名/表名支持 * 通配）
+      transform-rules:
+        - db-name: geo_source
+          table-name: dyn_tbl
+          field-name: note
+          source-value: "secret"
+          target-value: "MASKED"
       # 表忽略：DML 与 DDL 均跳过；支持多个 + 正则
       ignore-tables: []
       # 仅忽略 DDL 的表（结构变更不同步，但数据仍同步）；支持多个 + 正则
       ignore-ddl-tables: []
-      # 字段内容转换规则（可选）
-      transform-rules: []
 management:
   endpoints:
     web:

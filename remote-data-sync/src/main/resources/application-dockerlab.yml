@@ -33,6 +33,9 @@ drplatform:
       target-port: 13307
       target-user: root
       target-password: 123456
+      # 生产中心主备切换演练：备源地址（源主库 13306 不可用时切到 13308 继续同步）
+      source-standby-host: 127.0.0.1
+      source-standby-port: 13308
       ignore-databases:
         - DRPlatform
         - "re:^(?!(geo_source|biz_source)$).*$"

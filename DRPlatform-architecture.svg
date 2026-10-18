@@ -1,0 +1,82 @@
+<svg viewBox="0 0 720 860" role="img" xmlns="http://www.w3.org/2000/svg">
+  <title>DRPlatform 整体架构图</title>
+  <desc>用户接入层、应用服务层(Spring Boot 同步引擎)、数据存储层(源/目标/元数据 MySQL)、部署与测试层，以及数据同步流向与异常容错说明。</desc>
+  <defs>
+    <marker id="ah" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#5F5E5A"/></marker>
+  </defs>
+
+  <text x="360" y="26" text-anchor="middle" font-family="sans-serif" font-size="15" font-weight="500" fill="#042C53">DRPlatform 异地灾备同步服务 — 整体架构图</text>
+
+  <rect x="40" y="46" width="640" height="80" rx="10" fill="#E6F1FB" stroke="#185FA5" stroke-width="1.5"/>
+  <text x="56" y="66" font-family="sans-serif" font-size="13" font-weight="500" fill="#0C447C">① 用户接入层</text>
+  <rect x="64" y="74" width="280" height="42" rx="8" fill="#FFFFFF" stroke="#185FA5" stroke-width="1.5"/>
+  <text x="204" y="94" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="500" fill="#042C53">Web 管理后台</text>
+  <text x="204" y="110" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="400" fill="#5F5E5A">React SPA · 双主题(深/浅)</text>
+  <rect x="360" y="74" width="300" height="42" rx="8" fill="#FFFFFF" stroke="#185FA5" stroke-width="1.5"/>
+  <text x="510" y="94" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="500" fill="#042C53">REST API 客户端</text>
+  <text x="510" y="110" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="400" fill="#5F5E5A">curl / 外部集成系统</text>
+  <line x1="360" y1="126" x2="360" y2="150" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#ah)"/>
+
+  <rect x="40" y="150" width="640" height="304" rx="10" fill="#E6F1FB" stroke="#185FA5" stroke-width="1.5"/>
+  <text x="56" y="172" font-family="sans-serif" font-size="14" font-weight="500" fill="#042C53">② 应用服务层 — DRPlatform</text>
+  <text x="56" y="190" font-family="sans-serif" font-size="11" font-weight="400" fill="#5F5E5A">Spring Boot · 默认端口 8899 · flink.enabled=false 自研轮询水位引擎</text>
+  <rect x="64" y="202" width="592" height="52" rx="8" fill="#B5D4F4" stroke="#185FA5" stroke-width="1.5"/>
+  <text x="80" y="222" font-family="sans-serif" font-size="12" font-weight="500" fill="#042C53">接入与安全：Session 鉴权(AuthInterceptor) · CORS 白名单(禁 *+凭据) · SQL 注入标识符白名单</text>
+  <text x="80" y="240" font-family="sans-serif" font-size="12" font-weight="400" fill="#2C2C2A">密码存储：PBKDF2 哈希 + 动态映射 AES(ENC:) 落盘加密</text>
+  <text x="64" y="278" font-family="sans-serif" font-size="13" font-weight="500" fill="#0C447C">同步引擎核心</text>
+  <rect x="64" y="286" width="288" height="58" rx="8" fill="#FFFFFF" stroke="#185FA5" stroke-width="1.5"/>
+  <text x="208" y="308" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="500" fill="#042C53">SyncHostJob</text>
+  <text x="208" y="326" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="400" fill="#5F5E5A">2000ms 轮询 · update_time 水位</text>
+  <text x="208" y="340" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="400" fill="#5F5E5A">keyset 续扫 · 增量/全量</text>
+  <rect x="372" y="286" width="260" height="58" rx="8" fill="#FFFFFF" stroke="#185FA5" stroke-width="1.5"/>
+  <text x="502" y="308" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="500" fill="#042C53">SyncProgressJob</text>
+  <text x="502" y="326" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="400" fill="#5F5E5A">每 10s 持久化</text>
+  <text x="502" y="340" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="400" fill="#5F5E5A">sync_progress 表</text>
+  <rect x="64" y="352" width="288" height="58" rx="8" fill="#FFFFFF" stroke="#185FA5" stroke-width="1.5"/>
+  <text x="208" y="374" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="500" fill="#042C53">DatabaseSyncManager</text>
+  <text x="208" y="392" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="400" fill="#5F5E5A">全量/增量 · upsert 幂等</text>
+  <text x="208" y="406" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="400" fill="#5F5E5A">static 进度集合</text>
+  <rect x="372" y="352" width="260" height="58" rx="8" fill="#FFFFFF" stroke="#185FA5" stroke-width="1.5"/>
+  <text x="502" y="374" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="500" fill="#042C53">DatabaseMetadataService</text>
+  <text x="502" y="392" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="400" fill="#5F5E5A">自动发现库/表</text>
+  <text x="502" y="406" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="400" fill="#5F5E5A">忽略模式 + 字段转换</text>
+  <rect x="64" y="420" width="592" height="24" rx="8" fill="#B5D4F4" stroke="#185FA5" stroke-width="1.5"/>
+  <text x="80" y="436" font-family="sans-serif" font-size="11" font-weight="500" fill="#042C53">动态映射 DRPlatform-dynamic-mappings.json（密码 ENC: 加密 · 重启不丢）</text>
+  <line x1="360" y1="454" x2="360" y2="478" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#ah)"/>
+
+  <rect x="40" y="478" width="640" height="152" rx="10" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="1.5"/>
+  <text x="56" y="500" font-family="sans-serif" font-size="14" font-weight="500" fill="#444441">③ 数据存储层</text>
+  <rect x="64" y="512" width="184" height="94" rx="8" fill="#FFFFFF" stroke="#5F5E5A" stroke-width="1.5"/>
+  <text x="156" y="536" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="500" fill="#444441">源 MySQL 8.0</text>
+  <text x="156" y="556" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="400" fill="#5F5E5A">127.0.0.1:3306</text>
+  <text x="156" y="574" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="400" fill="#5F5E5A">业务库(用户库/表)</text>
+  <rect x="268" y="512" width="184" height="94" rx="8" fill="#FFFFFF" stroke="#5F5E5A" stroke-width="1.5"/>
+  <text x="360" y="536" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="500" fill="#444441">目标 MySQL 5.7</text>
+  <text x="360" y="556" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="400" fill="#5F5E5A">192.168.88.88:3306</text>
+  <text x="360" y="574" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="400" fill="#5F5E5A">灾备库 · 跨版本 DDL 清洗</text>
+  <rect x="472" y="512" width="184" height="94" rx="8" fill="#FFFFFF" stroke="#5F5E5A" stroke-width="1.5"/>
+  <text x="564" y="536" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="500" fill="#444441">元数据库 drplatform</text>
+  <text x="564" y="556" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="400" fill="#5F5E5A">本地 3306</text>
+  <text x="564" y="574" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="400" fill="#5F5E5A">进度/日志/用户</text>
+  <line x1="248" y1="560" x2="264" y2="560" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#ah)"/>
+  <text x="256" y="554" text-anchor="middle" font-family="sans-serif" font-size="10" font-weight="400" fill="#5F5E5A">同步</text>
+  <line x1="360" y1="630" x2="360" y2="654" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#ah)"/>
+
+  <rect x="40" y="654" width="640" height="142" rx="10" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="1.5"/>
+  <text x="56" y="676" font-family="sans-serif" font-size="14" font-weight="500" fill="#444441">④ 部署与运维 / 测试层</text>
+  <rect x="64" y="688" width="190" height="80" rx="8" fill="#FFFFFF" stroke="#5F5E5A" stroke-width="1.5"/>
+  <text x="159" y="712" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="500" fill="#444441">watchdog 守护</text>
+  <text x="159" y="732" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="400" fill="#5F5E5A">进程保活</text>
+  <text x="159" y="748" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="400" fill="#5F5E5A">开机自启</text>
+  <rect x="274" y="688" width="190" height="80" rx="8" fill="#FFFFFF" stroke="#5F5E5A" stroke-width="1.5"/>
+  <text x="369" y="712" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="500" fill="#444441">systemd 服务</text>
+  <text x="369" y="732" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="400" fill="#5F5E5A">生产托管</text>
+  <text x="369" y="748" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="400" fill="#5F5E5A">崩溃自拉起</text>
+  <rect x="484" y="688" width="190" height="80" rx="8" fill="#FFFFFF" stroke="#5F5E5A" stroke-width="1.5"/>
+  <text x="579" y="712" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="500" fill="#444441">Docker 隔离实验室</text>
+  <text x="579" y="732" text-anchor="middle" font-family="sans-serif" font-size="10" font-weight="400" fill="#5F5E5A">源/目标 MySQL 容器</text>
+  <text x="579" y="748" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="400" fill="#5F5E5A">test_17 / test_18</text>
+
+  <text x="40" y="824" font-family="sans-serif" font-size="11" font-weight="400" fill="#5F5E5A">数据流向：源库变更 → 2000ms 轮询水位 → keyset 增量/全量 → upsert 幂等 → 目标库。</text>
+  <text x="40" y="842" font-family="sans-serif" font-size="11" font-weight="400" fill="#5F5E5A">异常容错(源/目标/服务断电)：状态 ABNORMAL → 恢复重连 → 数据最终一致。</text>
+</svg>

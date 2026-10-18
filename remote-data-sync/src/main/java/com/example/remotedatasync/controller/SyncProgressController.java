@@ -48,12 +48,15 @@ public class SyncProgressController {
     private final SyncProgressService syncProgressService;
     private final DatabaseSyncManager databaseSyncManager;
     private final DatabaseMetadataService metadataService;
+    private final com.example.remotedatasync.cdc.FlinkCdcJobManager cdcJobManager;
 
     public SyncProgressController(SyncProgressService syncProgressService, DatabaseSyncManager databaseSyncManager,
-                                  DatabaseMetadataService metadataService) {
+                                  DatabaseMetadataService metadataService,
+                                  com.example.remotedatasync.cdc.FlinkCdcJobManager cdcJobManager) {
         this.syncProgressService = syncProgressService;
         this.databaseSyncManager = databaseSyncManager;
         this.metadataService = metadataService;
+        this.cdcJobManager = cdcJobManager;
     }
 
     /** 分页查询同步进度 */
@@ -325,6 +328,105 @@ public class SyncProgressController {
         }
     }
 
+    /**
+     * 主备切换：将指定主机对的同步源在「主库」与「备库」之间来回切换（需先配置 sourceStandbyHost）。
+     * <p>
+     * 该接口执行「源↔备源」地址交换，因此<b>可反复调用</b>：连续调用即可在主备之间往返任意多次。
+     * 切换时自动对齐新源自增位点并进入删除对账静默期，保证数据绝对一致且不丢。
+     * </p>
+     */
+    @OperationLogAnnotation(type = "MAPPING_SWITCH", desc = "主备切换源地址")
+    @PostMapping("/mapping/switchSource")
+    public Result<Map<String, Object>> switchSource(@RequestBody Map<String, String> body) {
+        String instanceKey = body == null ? null : body.get("instanceKey");
+        if (instanceKey == null || instanceKey.isEmpty()) {
+            throw new BusinessException(DRPlatformErrorCodeEnum.PARAM_ERROR.getCode(), "instanceKey 不能为空");
+        }
+        try {
+            boolean ok = databaseSyncManager.switchSourceToStandby(instanceKey);
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("switched", ok);
+            if (ok) {
+                DatabaseMapping m = databaseSyncManager.findByKey(instanceKey);
+                if (m != null) {
+                    data.put("sourceHost", m.getSourceHost());
+                    data.put("sourcePort", m.getSourcePort());
+                    data.put("standbyHost", m.getSourceStandbyHost());
+                    data.put("standbyPort", m.getSourceStandbyPort());
+                }
+            }
+            return Result.success(data);
+        } catch (IllegalStateException e) {
+            if (e.getMessage() != null && e.getMessage().startsWith("MAPPING_NOT_FOUND")) {
+                throw new BusinessException(DRPlatformErrorCodeEnum.MAPPING_REMOVE_NOT_FOUND.getCode(),
+                        DRPlatformErrorCodeEnum.MAPPING_REMOVE_NOT_FOUND.getMessage());
+            }
+            if (e.getMessage() != null && e.getMessage().startsWith("NO_STANDBY_CONFIGURED")) {
+                throw new BusinessException(DRPlatformErrorCodeEnum.MAPPING_ADD_FAILED.getCode(),
+                        "该映射未配置备源地址(sourceStandbyHost)");
+            }
+            throw new BusinessException(DRPlatformErrorCodeEnum.MAPPING_ADD_FAILED.getCode(), e.getMessage());
+        } catch (BusinessException e) {
+            throw e;
+        } catch (Exception e) {
+            log.error("Failed to switch source for {}", instanceKey, e);
+            throw new BusinessException(DRPlatformErrorCodeEnum.MAPPING_ADD_FAILED.getCode(),
+                    DRPlatformErrorCodeEnum.MAPPING_ADD_FAILED.getMessage());
+        }
+    }
+
+    /**
+     * 生产中心 ↔ 灾备中心角色互换（灾备切生产 / 生产切灾备）。
+     * <p>
+     * 与 {@code /sync/mapping/switchSource}（同中心内部主库↔备库）不同，本接口交换的是
+     * <b>同步方向</b>：原灾备中心提升为生产中心，原生产中心降级为灾备中心。
+     * 连续调用两次回到初始方向，因此「灾备切生产」与「生产切灾备」共用这一个接口。
+     * </p>
+     */
+    @OperationLogAnnotation(type = "MAPPING_REVERSE", desc = "生产/灾备中心角色互换")
+    @PostMapping("/mapping/reverse")
+    public Result<Map<String, Object>> reverseDirection(@RequestBody Map<String, String> body) {
+        String instanceKey = body == null ? null : body.get("instanceKey");
+        if (instanceKey == null || instanceKey.isEmpty()) {
+            throw new BusinessException(DRPlatformErrorCodeEnum.PARAM_ERROR.getCode(), "instanceKey 不能为空");
+        }
+        try {
+            boolean ok = databaseSyncManager.reverseDirection(instanceKey);
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("reversed", ok);
+            if (ok) {
+                DatabaseMapping m = databaseSyncManager.findByKey(instanceKey);
+                if (m == null) {
+                    // 换向后 instanceKey 已变化，按新方向重新定位（端口信息随之互换）
+                    m = databaseSyncManager.getMappings().stream()
+                            .filter(x -> x.getLinkKey().equals(instanceKey)
+                                    || instanceKey.equals(x.getHostOnlyKey()))
+                            .findFirst().orElse(null);
+                }
+                if (m != null) {
+                    data.put("instanceKey", m.getInstanceKey());
+                    data.put("sourceHost", m.getSourceHost());
+                    data.put("sourcePort", m.getSourcePort());
+                    data.put("targetHost", m.getTargetHost());
+                    data.put("targetPort", m.getTargetPort());
+                }
+            }
+            return Result.success(data);
+        } catch (IllegalStateException e) {
+            if (e.getMessage() != null && e.getMessage().startsWith("MAPPING_NOT_FOUND")) {
+                throw new BusinessException(DRPlatformErrorCodeEnum.MAPPING_REMOVE_NOT_FOUND.getCode(),
+                        DRPlatformErrorCodeEnum.MAPPING_REMOVE_NOT_FOUND.getMessage());
+            }
+            throw new BusinessException(DRPlatformErrorCodeEnum.MAPPING_ADD_FAILED.getCode(), e.getMessage());
+        } catch (BusinessException e) {
+            throw e;
+        } catch (Exception e) {
+            log.error("Failed to reverse direction for {}", instanceKey, e);
+            throw new BusinessException(DRPlatformErrorCodeEnum.MAPPING_ADD_FAILED.getCode(),
+                    DRPlatformErrorCodeEnum.MAPPING_ADD_FAILED.getMessage());
+        }
+    }
+
     /** 根据 IP 获取其下用户数据库列表 */
     @GetMapping("/databases/{ips}")
     public List<String> getDatabasesByIp(@PathVariable String ips) {
@@ -353,6 +455,72 @@ public class SyncProgressController {
             log.error("Failed to retrieve overall sync status", e);
             DRPlatformErrorCodeEnum.throwException(DRPlatformErrorCodeEnum.GET_SYNC_PROGRESS_ALL_STATE_FAILED);
             return new HashMap<>();
+        }
+    }
+
+    // ===================== Flink CDC 实时状态 / 运维 =====================
+
+    /**
+     * 返回所有主机对的 Flink CDC 作业实时状态：运行态、jobId、最近 savepoint、
+     * 实时同步延迟（lagSeconds）、是否超阈值（lagging）、累计应用条数。
+     * 前端据此展示「实时同步延迟 < 10s」达标情况。
+     */
+    @GetMapping("/cdc/jobs")
+    public Result<List<Map<String, Object>>> cdcJobs() {
+        try {
+            if (!cdcJobManager.isCdcMode()) {
+                Map<String, Object> m = new LinkedHashMap<>();
+                m.put("mode", "polling");
+                m.put("cdcEnabled", false);
+                return Result.success(List.of(m));
+            }
+            return Result.success(cdcJobManager.allStatus(databaseSyncManager.getMappings()));
+        } catch (Exception e) {
+            log.error("Failed to list CDC jobs", e);
+            throw new BusinessException(DRPlatformErrorCodeEnum.GET_SYNC_PROGRESS_LIST_FAILED.getCode(),
+                    "获取 CDC 作业状态失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 手动触发 savepoint（不停机打点，归档当前 binlog 位点）。
+     * 用于计划内维护前的位点备份，与 @PreDestroy / 移除映射的 stopWithSavepoint 互补。
+     */
+    @OperationLogAnnotation(type = "CDC_SAVEPOINT", desc = "触发 CDC savepoint")
+    @PostMapping("/cdc/savepoint/{instanceKey}")
+    public Result<Map<String, Object>> triggerCdcSavepoint(@PathVariable String instanceKey) {
+        try {
+            String path = cdcJobManager.triggerSavepoint(instanceKey);
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("instanceKey", instanceKey);
+            m.put("savepointPath", path);
+            return Result.success(m);
+        } catch (IllegalStateException e) {
+            throw new BusinessException(DRPlatformErrorCodeEnum.MAPPING_ADD_FAILED.getCode(), e.getMessage());
+        } catch (Exception e) {
+            log.error("Failed to trigger CDC savepoint for {}", instanceKey, e);
+            throw new BusinessException(DRPlatformErrorCodeEnum.MAPPING_ADD_FAILED.getCode(),
+                    "触发 CDC savepoint 失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 停止指定主机对 CDC 作业并打 savepoint（优雅停机；重启后由元库记录的位点恢复）。
+     */
+    @OperationLogAnnotation(type = "CDC_STOP", desc = "停止 CDC 作业并打 savepoint")
+    @PostMapping("/cdc/stop/{instanceKey}")
+    public Result<Map<String, Object>> stopCdcJob(@PathVariable String instanceKey) {
+        try {
+            String path = cdcJobManager.stopWithSavepoint(instanceKey);
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("instanceKey", instanceKey);
+            m.put("savepointPath", path);
+            m.put("stopped", true);
+            return Result.success(m);
+        } catch (Exception e) {
+            log.error("Failed to stop CDC job for {}", instanceKey, e);
+            throw new BusinessException(DRPlatformErrorCodeEnum.MAPPING_ADD_FAILED.getCode(),
+                    "停止 CDC 作业失败: " + e.getMessage());
         }
     }
 }

@@ -1,0 +1,43 @@
+# ===================== DRPlatform 大数据量压测实验室 profile =====================
+# 激活方式：SPRING_PROFILES_ACTIVE=perflab（配合 tests/run_perf_45db.py）
+# 用途：45 个数据库 × 约 67 张表 ≈ 3000 张表并发同步压测
+#   - 元数据库仍用宿主机本地 127.0.0.1:3306/drplatform（管控面）
+#   - 同步映射源 13306 → 目标 13307（Docker 容器），与真实部署隔离
+#   - 仅同步 perf_db_00 ~ perf_db_44 共 45 个库，其余库一律忽略
+#   - 引擎参数保持默认（poll-interval-ms=2000 / batch-size=1000），
+#     用于评估「默认配置」在 3000 表规模下的真实表现（内存/线程/速度/反压）
+spring:
+  config:
+    activate:
+      on-profile: perflab
+  datasource:
+    url: jdbc:mysql://127.0.0.1:3306/drplatform?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false
+    username: root
+    password: 123456
+
+app:
+  auth:
+    enabled: true
+
+drplatform:
+  standby-mode: true
+  flink:
+    enabled: false
+  engine:
+    poll-interval-ms: 2000
+  mappings:
+    - source-host: 127.0.0.1
+      source-port: 13306
+      source-user: root
+      source-password: 123456
+      target-host: 127.0.0.1
+      target-port: 13307
+      target-user: root
+      target-password: 123456
+      # 只同步 perf_db_NN（45 个库），其余全部忽略
+      ignore-databases:
+        - DRPlatform
+        - "re:^(?!perf_db_\\d+$).*$"
+      ignore-tables: []
+      ignore-ddl-tables: []
+      transform-rules: []

@@ -124,18 +124,29 @@ public class DatabaseMetadataService {
         assertSafeIdentifier(tableName);
         List<String> columns = new ArrayList<>();
         List<String> pk = new ArrayList<>();
+        StringBuilder defs = new StringBuilder();
         Connection conn = null;
         try {
             conn = connMgr.getConnection(cfg);
-            // 列
+            // 列（含类型/长度/可空性，供 DDL 结构变更检测）
             try (PreparedStatement ps = conn.prepareStatement(
-                    "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+                    "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE "
+                            + "FROM information_schema.COLUMNS "
                             + "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION")) {
                 ps.setString(1, dbName);
                 ps.setString(2, tableName);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
-                        columns.add(rs.getString(1));
+                        String colName = rs.getString(1);
+                        columns.add(colName);
+                        // 归一化类型描述：COLUMN_TYPE 已含长度/精度/无符号等信息
+                        String colType = rs.getString(3);
+                        if (colType == null || colType.isEmpty()) {
+                            colType = rs.getString(2);
+                        }
+                        String nullable = rs.getString(4);
+                        defs.append(colName).append(':').append(colType).append(':')
+                                .append("YES".equalsIgnoreCase(nullable) ? "NULL" : "NOTNULL").append(';');
                     }
                 }
             }
@@ -159,7 +170,9 @@ public class DatabaseMetadataService {
         if (columns.isEmpty()) {
             return null;
         }
-        return new TableInfo(tableName, pk, columns);
+        TableInfo info = new TableInfo(tableName, pk, columns);
+        info.setColumnDefs(defs.toString());
+        return info;
     }
 
     /** 获取源表建表语句（去掉库限定符，便于在目标库执行） */

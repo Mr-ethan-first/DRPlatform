@@ -27,7 +27,11 @@ import java.util.stream.Collectors;
  * 表级 Sink：负责单个表的具体数据批量写入与分区管理。
  * <p>
  * 本地可运行版本中，它等价于 Flink 的 RichSinkFunction：从队列中取批次，
- * 经过 WAL 重试后写入目标库；多次失败的事件进入死信队列由定时器重试。
+ * 经过 WAL 重试后写入目标库；批次事务<b>成功提交后</b>通过 {@link WatermarkAck} 回调通知引擎推进水位。
+ * </p>
+ * <p>
+ * <b>一致性保证</b>：enqueue 不再「超时丢弃」，目标端不可用 / 写入慢时改为<b>背压阻塞</b>；
+ * 水位只会在落库成功后经 ack 推进，因此任何时刻水位都 ≤ 已落库数据，崩溃 / 断电 / 断网均不丢数据。
  * </p>
  *
  * @author 50707
@@ -42,14 +46,18 @@ public class TableSinkFunction {
     private final TableLevelQueueManager.TableQueue queue;
     private final int batchSize;
     private final int maxWalRetries;
+    private final String dbName;
+    private final WatermarkAck ack;
 
     private volatile boolean running = true;
     private volatile boolean hasActiveProcessor = false;
     private volatile long lastProcessTime = System.currentTimeMillis();
 
-    /** 死信队列（单条重试）。设容量上限：目标端长时间不可用时，超出部分丢弃，
-     *  依赖下一轮全量重扫补偿（幂等 upsert），保证最终一致且不撑爆 JVM 堆。 */
+    /** 死信队列（单条重试）。设容量上限：目标端长时间不可用时，超出部分不再入队，
+     *  依赖下一轮重扫补偿（水位未推进，at-least-once 幂等 upsert），保证最终一致且不撑爆 JVM 堆。 */
     private static final int MAX_DEAD_LETTER = 100_000;
+    /** enqueue 背压超时：目标端不可用 / 写入慢时阻塞等待，超时则抛异常由上层不推进水位、下轮重扫 */
+    private static final long ENQUEUE_TIMEOUT_MS = 120_000L;
     private final ConcurrentLinkedQueue<RowChange> pendingFailedEvents = new ConcurrentLinkedQueue<>();
 
     private Thread processorThread;
@@ -59,7 +67,8 @@ public class TableSinkFunction {
                              DynamicShardedConnectionManager connMgr,
                              GroupedExecutorManager executorManager,
                              TableLevelQueueManager.TableQueue queue,
-                             int batchSize, int maxWalRetries) {
+                             int batchSize, int maxWalRetries,
+                             String dbName, WatermarkAck ack) {
         this.targetDB = targetDB;
         this.tableInfo = tableInfo;
         this.connMgr = connMgr;
@@ -67,25 +76,30 @@ public class TableSinkFunction {
         this.queue = queue;
         this.batchSize = Math.max(100, batchSize);
         this.maxWalRetries = Math.max(1, maxWalRetries);
+        this.dbName = dbName;
+        this.ack = ack;
     }
 
     public void start() {
         startFailedEventRetry();
-        processorThread = new Thread(this::processorLoop, "TableSink-" + tableInfo.getTableName());
+        processorThread = new Thread(this::processorLoop, "TableSink-" + dbName + "." + tableInfo.getTableName());
         processorThread.setDaemon(true);
         processorThread.start();
     }
 
+    /**
+     * 入队（背压）：队列满则阻塞等待，直到有空间或超时。
+     * <b>绝不丢弃</b>：超时抛异常由上层捕获 → 该批不推进水位 → 下轮重扫（幂等 upsert 补偿），保证不丢。
+     */
     public void enqueue(RowChange change) {
-        // 反压：队列满则自旋等待（由上层控制整体速率）
-        // 设 60 秒超时上限：防止目标端长时间不可用时阻塞调度线程，
-        // 超时后丢弃事件（下一轮全量重扫会通过幂等 upsert 补偿）。
-        long deadline = System.currentTimeMillis() + 60_000;
-        while (running && !queue.offer(change)) {
-            if (System.currentTimeMillis() > deadline) {
-                log.warn("enqueue timeout (60s) for table {}, queue full, dropping event (pk={}), "
-                        + "will be re-synced by next full scan", tableInfo.getTableName(), change.getPrimaryKeyValue());
+        long deadline = System.currentTimeMillis() + ENQUEUE_TIMEOUT_MS;
+        while (running) {
+            if (queue.offer(change)) {
                 return;
+            }
+            if (System.currentTimeMillis() > deadline) {
+                throw new IllegalStateException("enqueue timeout after " + ENQUEUE_TIMEOUT_MS
+                        + "ms, target unreachable/slow; watermark will NOT advance (will be re-synced by next rescan)");
             }
             try {
                 Thread.sleep(10);
@@ -107,16 +121,43 @@ public class TableSinkFunction {
                 hasActiveProcessor = true;
                 @SuppressWarnings("unchecked")
                 List<RowChange> changes = (List<RowChange>) (List<?>) batch;
-                processBatchWithWal(changes);
-                lastProcessTime = System.currentTimeMillis();
-                hasActiveProcessor = false;
+                try {
+                    processBatchWithWal(changes);
+                    // 落库成功 → 回调 ack 推进水位（仅当含有效 update_time 行）
+                    ackBatch(changes);
+                } finally {
+                    hasActiveProcessor = false;
+                    lastProcessTime = System.currentTimeMillis();
+                }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 break;
             } catch (Exception e) {
-                log.error("Processor loop error for table {}", tableInfo.getTableName(), e);
-                hasActiveProcessor = false;
+                log.error("Processor loop error for table {}.{}", dbName, tableInfo.getTableName(), e);
             }
+        }
+    }
+
+    /** 计算本批水位锚点并回调 ack */
+    private void ackBatch(List<RowChange> changes) {
+        if (ack == null) {
+            return;
+        }
+        LocalDateTime maxTime = null;
+        Object lastKey = null;
+        for (RowChange c : changes) {
+            LocalDateTime t = c.getWatermarkTime();
+            if (t != null) {
+                if (maxTime == null || t.isAfter(maxTime)) {
+                    maxTime = t;
+                    lastKey = c.getWatermarkKey();
+                } else if (t.equals(maxTime)) {
+                    lastKey = c.getWatermarkKey();
+                }
+            }
+        }
+        if (maxTime != null) {
+            ack.ack(dbName, tableInfo.getTableName(), maxTime, lastKey);
         }
     }
 
@@ -134,11 +175,11 @@ public class TableSinkFunction {
             } catch (SQLException e) {
                 attempt++;
                 if (attempt >= maxWalRetries) {
-                    log.error("Batch failed after {} attempts, degrading to single-row processing, table={}, size={}",
-                            maxWalRetries, tableInfo.getTableName(), changes.size(), e);
+                    log.error("Batch failed after {} attempts, degrading to single-row processing, table={}.{}, size={}",
+                            maxWalRetries, dbName, tableInfo.getTableName(), changes.size(), e);
                     degradeToSingle(changes);
                 } else {
-                    log.warn("Batch attempt {} failed, will retry, table={}", attempt, tableInfo.getTableName());
+                    log.warn("Batch attempt {} failed, will retry, table={}.{}", attempt, dbName, tableInfo.getTableName());
                     try {
                         Thread.sleep(500L * attempt);
                     } catch (InterruptedException ie) {
@@ -153,14 +194,18 @@ public class TableSinkFunction {
         for (RowChange c : changes) {
             try {
                 processSingleEvent(c);
+                // 单条成功落库 → ack（单调推进，旧时间不回退水位）
+                if (ack != null && c.getWatermarkTime() != null) {
+                    ack.ack(dbName, tableInfo.getTableName(), c.getWatermarkTime(), c.getWatermarkKey());
+                }
             } catch (SQLException e) {
                 if (pendingFailedEvents.size() >= MAX_DEAD_LETTER) {
-                    log.error("Dead-letter exceeded cap ({}), dropping event (re-synced by next full scan), table={}, pk={}",
-                            MAX_DEAD_LETTER, tableInfo.getTableName(), c.getPrimaryKeyValue(), e);
+                    log.error("Dead-letter exceeded cap ({}), dropping event (re-synced by next full scan), table={}.{}, pk={}",
+                            MAX_DEAD_LETTER, dbName, tableInfo.getTableName(), c.getPrimaryKeyValue(), e);
                     continue;
                 }
-                log.error("Single-row processing failed, moved to dead-letter, table={}, pk={}",
-                        tableInfo.getTableName(), c.getPrimaryKeyValue(), e);
+                log.error("Single-row processing failed, moved to dead-letter, table={}.{}, pk={}",
+                        dbName, tableInfo.getTableName(), c.getPrimaryKeyValue(), e);
                 pendingFailedEvents.offer(c);
             }
         }
@@ -226,6 +271,11 @@ public class TableSinkFunction {
 
     private void executeUpsert(Connection conn, RowChange change) throws SQLException {
         Set<String> validCols = tableInfo.getColumns().stream().collect(Collectors.toSet());
+        // 主键列不参与 UPDATE：主键被改写会破坏目标端主键与源端的一致性，
+        // 且在主备切换/换源场景下可能造成主键漂移与对账误判。幂等靠唯一键冲突即可达成。
+        Set<String> pkCols = tableInfo.getPrimaryKeyColumns() == null
+                ? java.util.Collections.emptySet()
+                : new java.util.HashSet<>(tableInfo.getPrimaryKeyColumns());
         List<String> cols = new ArrayList<>();
         List<Object> vals = new ArrayList<>();
         for (Map.Entry<String, Object> e : change.getAfter().entrySet()) {
@@ -239,7 +289,15 @@ public class TableSinkFunction {
         }
         String colList = String.join(",", cols);
         String placeholders = cols.stream().map(c -> "?").collect(Collectors.joining(","));
-        String updateList = cols.stream().map(c -> c + "=VALUES(" + c + ")").collect(Collectors.joining(","));
+        // UPDATE 列表排除主键列
+        List<String> updCols = cols.stream().filter(c -> !pkCols.contains(c)).collect(Collectors.toList());
+        String updateList;
+        if (updCols.isEmpty()) {
+            // 全部列都是主键列（极端表结构）：用无副作用的 no-op 保持「存在即不重复插入」
+            updateList = cols.get(0) + "=" + cols.get(0);
+        } else {
+            updateList = updCols.stream().map(c -> c + "=VALUES(" + c + ")").collect(Collectors.joining(","));
+        }
         String sql = "INSERT INTO " + quote(tableInfo.getTableName()) + " (" + colList + ") VALUES (" + placeholders + ") "
                 + "ON DUPLICATE KEY UPDATE " + updateList;
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
@@ -253,7 +311,7 @@ public class TableSinkFunction {
     private void executeDelete(Connection conn, RowChange change) throws SQLException {
         List<String> pkCols = tableInfo.getPrimaryKeyColumns();
         if (pkCols == null || pkCols.isEmpty()) {
-            log.warn("No primary key for delete on table {}, skip", tableInfo.getTableName());
+            log.warn("No primary key for delete on table {}.{}, skip", dbName, tableInfo.getTableName());
             return;
         }
         String where = pkCols.stream().map(c -> c + "=?").collect(Collectors.joining(" AND "));
@@ -295,7 +353,7 @@ public class TableSinkFunction {
 
     private void startFailedEventRetry() {
         failedEventRetryScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "FailedEventRetry-" + tableInfo.getTableName());
+            Thread t = new Thread(r, "FailedEventRetry-" + dbName + "." + tableInfo.getTableName());
             t.setDaemon(true);
             return t;
         });
@@ -311,8 +369,12 @@ public class TableSinkFunction {
             for (RowChange change : retry) {
                 try {
                     processSingleEvent(change);
+                    // 死信重试成功 → ack（单调，不回退水位）
+                    if (ack != null && change.getWatermarkTime() != null) {
+                        ack.ack(dbName, tableInfo.getTableName(), change.getWatermarkTime(), change.getWatermarkKey());
+                    }
                 } catch (SQLException e) {
-                    log.error("Dead-letter retry failed again, table={}, pk={}", tableInfo.getTableName(), change.getPrimaryKeyValue(), e);
+                    log.error("Dead-letter retry failed again, table={}.{}, pk={}", dbName, tableInfo.getTableName(), change.getPrimaryKeyValue(), e);
                     pendingFailedEvents.offer(change);
                 }
             }
@@ -356,7 +418,7 @@ public class TableSinkFunction {
         if (processorThread != null) {
             processorThread.interrupt();
         }
-        // 尝试 flush 剩余队列
+        // 尝试 flush 剩余队列（落库成功后 ack 会推进水位）
         try {
             List<Object> remaining = queue.drain(batchSize * 4);
             if (!remaining.isEmpty()) {
@@ -364,8 +426,9 @@ public class TableSinkFunction {
                 List<RowChange> changes = (List<RowChange>) (List<?>) remaining;
                 try {
                     processBatchInternal(changes);
+                    ackBatch(changes);
                 } catch (SQLException e) {
-                    log.warn("Flush on close failed for table {}", tableInfo.getTableName(), e);
+                    log.warn("Flush on close failed for table {}.{}", dbName, tableInfo.getTableName(), e);
                 }
             }
         } catch (Exception e) {
